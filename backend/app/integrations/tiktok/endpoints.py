@@ -125,6 +125,8 @@ _ITEMS = (
         Scope.PRODUCT_WRITE,
         write=True,
         retry=RetryPolicy.NEVER,
+        enabled=False,
+        official_anomaly="exact official image-upload contract is not present in the verified evidence set",
     ),
     _endpoint(
         "local.create",

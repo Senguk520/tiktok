@@ -80,6 +80,26 @@ class DraftSubmissionResult:
     replayed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ProductCapabilityEvidence:
+    """Runtime evidence gates for platform calls whose exact contracts are not yet verified."""
+
+    image_upload_verified: bool = False
+    live_submission_validation_verified: bool = False
+
+    def require_image_upload(self) -> None:
+        if not self.image_upload_verified:
+            raise ProductSubmissionBlocked(
+                "TikTok product image upload is blocked until its exact official endpoint is verified"
+            )
+
+    def require_submission(self) -> None:
+        if not self.live_submission_validation_verified:
+            raise ProductSubmissionBlocked(
+                "TikTok product submission is blocked until live category and attribute validation is verified"
+            )
+
+
 def _failure_category(exc: BaseException) -> ErrorCategory | None:
     failure = getattr(exc, "failure", None)
     category = getattr(failure, "category", None)
@@ -100,8 +120,14 @@ def _submission_from_operation(
 
 
 class ProductService:
-    def __init__(self, gateway: ProductGateway) -> None:
+    def __init__(
+        self,
+        gateway: ProductGateway,
+        *,
+        capabilities: ProductCapabilityEvidence | None = None,
+    ) -> None:
         self._gateway = gateway
+        self._capabilities = capabilities or ProductCapabilityEvidence()
 
     async def save_draft(
         self,
@@ -150,6 +176,7 @@ class ProductService:
         use_case: str = "MAIN_IMAGE",
     ) -> ImageUploadResult:
         context.require_active()
+        self._capabilities.require_image_upload()
         safe_filename = validate_image_bytes(
             filename,
             content_type=content_type,
@@ -240,6 +267,7 @@ class ProductService:
         idempotency_key: str,
     ) -> DraftSubmissionResult:
         mode = context.require_listing_write()
+        self._capabilities.require_submission()
         draft = await get_owned_draft(
             session,
             shop_binding_id=context.shop_binding_id,

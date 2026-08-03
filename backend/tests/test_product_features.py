@@ -34,10 +34,18 @@ from app.integrations.tiktok.endpoints import ENDPOINTS
 from app.integrations.tiktok.products import ProductSubmission, UploadedProductImage
 from app.repositories.catalog import ListingQuotaBlocked
 from app.use_cases.commerce_context import CommerceAccessBlocked, ShopAccessContext
-from app.use_cases.products import ProductService
+from app.use_cases.products import (
+    ProductCapabilityEvidence,
+    ProductService,
+    ProductSubmissionBlocked,
+)
 from migrations.core import migrate_engine
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"safe-test-image"
+VERIFIED_CAPABILITIES = ProductCapabilityEvidence(
+    image_upload_verified=True,
+    live_submission_validation_verified=True,
+)
 
 
 class FakeProductGateway:
@@ -142,18 +150,60 @@ def test_normalized_product_payload_is_stable_and_strict() -> None:
         normalized_product_from_payload(payload)
 
 
-def test_image_endpoint_is_registered_without_automatic_retry() -> None:
+def test_image_endpoint_is_registered_but_disabled_without_verified_evidence() -> None:
     endpoint = ENDPOINTS["product.image.upload"]
     assert endpoint.path == "/product/202309/images/upload"
     assert endpoint.scope is Scope.PRODUCT_WRITE
+    assert not endpoint.enabled
+    assert endpoint.official_anomaly
     assert not endpoint.automatic_retry_allowed
+
+
+@pytest.mark.asyncio
+async def test_unverified_product_calls_fail_before_gateway() -> None:
+    engine, session_factory = await factory()
+    gateway = FakeProductGateway()
+    service = ProductService(gateway)
+    try:
+        async with session_factory() as session:
+            binding = ShopBinding(
+                open_id="owner-blocked",
+                shop_id="shop-blocked",
+                region="MY",
+                listing_mode=ListingMode.LOCAL_REPLICATION.value,
+                authorization_status=AuthorizationStatus.ACTIVE.value,
+            )
+            session.add(binding)
+            await session.flush()
+            access = context(binding, ListingMode.LOCAL_REPLICATION)
+            with pytest.raises(ProductSubmissionBlocked, match="image upload"):
+                await service.upload_draft_image(
+                    session,
+                    access,
+                    draft_id="not-read",
+                    source_ref="collector-image:main",
+                    content=PNG,
+                    filename="main.png",
+                    content_type="image/png",
+                )
+            with pytest.raises(ProductSubmissionBlocked, match="live category"):
+                await service.submit_draft(
+                    session,
+                    access,
+                    draft_id="not-read",
+                    idempotency_key="not-persisted",
+                )
+            assert gateway.upload_calls == 0
+            assert gateway.create_modes == []
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
 async def test_local_draft_image_quota_and_submission_are_one_durable_chain() -> None:
     engine, session_factory = await factory()
     gateway = FakeProductGateway()
-    service = ProductService(gateway)
+    service = ProductService(gateway, capabilities=VERIFIED_CAPABILITIES)
     now = datetime.now(UTC)
     try:
         async with session_factory() as session:
@@ -228,7 +278,7 @@ async def test_local_draft_image_quota_and_submission_are_one_durable_chain() ->
 async def test_global_mode_never_falls_back_to_local_or_consumes_local_quota() -> None:
     engine, session_factory = await factory()
     gateway = FakeProductGateway()
-    service = ProductService(gateway)
+    service = ProductService(gateway, capabilities=VERIFIED_CAPABILITIES)
     try:
         async with session_factory() as session:
             binding = ShopBinding(
@@ -271,7 +321,7 @@ async def test_global_mode_never_falls_back_to_local_or_consumes_local_quota() -
 async def test_unknown_mode_and_unknown_quota_fail_before_gateway_call() -> None:
     engine, session_factory = await factory()
     gateway = FakeProductGateway()
-    service = ProductService(gateway)
+    service = ProductService(gateway, capabilities=VERIFIED_CAPABILITIES)
     try:
         async with session_factory() as session:
             binding = ShopBinding(

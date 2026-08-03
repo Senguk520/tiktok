@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -25,10 +26,10 @@ class LoopbackOnlyMiddleware(BaseHTTPMiddleware):
         except ValueError:
             # Starlette's in-process TestClient uses this synthetic hostname.
             if host != "testclient":
-                return JSONResponse({"detail": "collector is loopback only"}, status_code=403)
+                return JSONResponse({"detail": "service is loopback only"}, status_code=403)
         else:
             if not address.is_loopback:
-                return JSONResponse({"detail": "collector is loopback only"}, status_code=403)
+                return JSONResponse({"detail": "service is loopback only"}, status_code=403)
         return await call_next(request)
 
 
@@ -60,8 +61,21 @@ def _frontend_origins() -> list[str]:
     return origins
 
 
-def install_security_middleware(app: FastAPI, *, allow_browser: bool = False) -> None:
-    """Install deterministic no-cache headers and optional narrow browser CORS."""
+def _allowed_hosts() -> list[str]:
+    configured = os.environ.get("SERVICE_ALLOWED_HOSTS", "127.0.0.1,localhost,testserver")
+    hosts = [host.strip() for host in configured.split(",") if host.strip()]
+    if not hosts or any(host == "*" or "://" in host or "/" in host for host in hosts):
+        raise ValueError("SERVICE_ALLOWED_HOSTS must contain explicit host names")
+    return hosts
+
+
+def install_security_middleware(
+    app: FastAPI,
+    *,
+    allow_browser: bool = False,
+    loopback_only: bool | None = None,
+) -> None:
+    """Install host/loopback restrictions, no-cache headers, and narrow browser CORS."""
 
     add_middleware = app.add_middleware
     if allow_browser:
@@ -74,7 +88,8 @@ def install_security_middleware(app: FastAPI, *, allow_browser: bool = False) ->
             expose_headers=["X-Request-ID"],
             max_age=0,
         )
-    else:
+    if loopback_only is True or (loopback_only is None and not allow_browser):
         add_middleware(LoopbackOnlyMiddleware)
-    # Added last so even CORS preflight and loopback denials receive no-store.
+    add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts())
+    # Added last so even CORS preflight, host failures, and loopback denials receive no-store.
     add_middleware(NoStoreSecurityMiddleware)

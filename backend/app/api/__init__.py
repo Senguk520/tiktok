@@ -1,0 +1,1 @@
+"""Protected HTTP boundary for the Core application."""
