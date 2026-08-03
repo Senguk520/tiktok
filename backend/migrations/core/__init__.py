@@ -13,6 +13,24 @@ from app.db import models as _core_models  # noqa: F401
 from app.db.base import Base, DatabaseSettings, create_engine_and_session_factory, database_settings
 
 _VERSION_TABLE = "core_schema_migrations"
+_V1_TABLE_NAMES = (
+    "admin_sessions",
+    "oauth_transactions",
+    "encrypted_credentials",
+    "shop_binding",
+    "scope_snapshots",
+    "listing_mode_evidence",
+    "product_drafts",
+    "product_links",
+    "market_product_states",
+    "idempotent_operations",
+    "quota_snapshots",
+    "order_sync_checkpoints",
+    "schedule_jobs",
+    "schedule_runs",
+    "audit_logs",
+    "rate_limit_windows",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,12 +40,22 @@ class Migration:
     apply: Callable[[AsyncConnection], Awaitable[None]]
 
 
+async def _create_tables(connection: AsyncConnection, names: Sequence[str]) -> None:
+    tables = [Base.metadata.tables[name] for name in names]
+    await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=tables))
+
+
 async def _initial_schema(connection: AsyncConnection) -> None:
-    await connection.run_sync(Base.metadata.create_all)
+    await _create_tables(connection, _V1_TABLE_NAMES)
+
+
+async def _product_image_assets(connection: AsyncConnection) -> None:
+    await _create_tables(connection, ("product_image_assets",))
 
 
 MIGRATIONS: Sequence[Migration] = (
     Migration(version=1, name="initial_core_business_schema", apply=_initial_schema),
+    Migration(version=2, name="product_image_asset_registry", apply=_product_image_assets),
 )
 
 

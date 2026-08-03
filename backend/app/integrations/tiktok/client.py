@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from app.integrations.tiktok.endpoints import Endpoint, RetryPolicy
+from app.integrations.tiktok.endpoints import Endpoint, ProductImageUseCase, RetryPolicy
 from app.integrations.tiktok.endpoints import endpoint as get_endpoint
 from app.integrations.tiktok.errors import ErrorCategory, Failure, classify_failure
 from app.integrations.tiktok.signing import QueryValue, with_signature
@@ -212,6 +212,84 @@ class TikTokClient:
             last_failure or classify_failure(http_status=None),
             endpoint_key=endpoint_key,
         )
+
+    async def upload_product_image(
+        self,
+        *,
+        access_token: str,
+        image: bytes,
+        filename: str,
+        content_type: str,
+        use_case: ProductImageUseCase | str = ProductImageUseCase.MAIN_IMAGE,
+        shop_cipher: str | None = None,
+    ) -> TikTokResult:
+        """Upload one validated image without signing multipart body bytes.
+
+        httpx owns multipart boundary serialization. TikTok explicitly excludes
+        multipart bodies from the signature, so only the final path and query
+        values are signed. Uploads are never retried automatically because the
+        platform has no caller-supplied idempotency key for this endpoint.
+        """
+
+        selected = get_endpoint("product.image.upload")
+        try:
+            selected_use_case = ProductImageUseCase(use_case)
+        except ValueError as exc:
+            raise ValueError("unsupported product image use case") from exc
+        if not image or not filename.strip() or not content_type.startswith("image/"):
+            raise ValueError("image bytes, filename and image content type are required")
+        path = selected.build_path()
+        query_values: dict[str, QueryValue] = {"use_case": selected_use_case.value}
+        if shop_cipher is not None:
+            query_values["shop_cipher"] = shop_cipher
+        signed = with_signature(
+            app_key=self._config.app_key,
+            app_secret=self._config.app_secret,
+            timestamp=int(datetime.now(UTC).timestamp()),
+            path=path,
+            query=query_values,
+            body=b"",
+            content_type="multipart/form-data",
+        )
+        headers = {
+            "Accept": "application/json",
+            "x-tts-access-token": access_token,
+        }
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._config.api_base_url,
+                timeout=self._config.timeout_seconds,
+                follow_redirects=False,
+            ) as client:
+                response = await client.request(
+                    selected.method,
+                    path,
+                    params=signed.values,
+                    headers=headers,
+                    files={"data": (filename, image, content_type)},
+                )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            failure = classify_failure(http_status=None, ambiguous_write=True)
+            raise TikTokClientError(failure, endpoint_key=selected.key) from exc
+        if len(response.content) > self._config.max_response_bytes:
+            failure = classify_failure(http_status=response.status_code)
+            raise TikTokClientError(failure, endpoint_key=selected.key)
+        payload = self._decode_json(response)
+        business_code = payload.get("code") if isinstance(payload, dict) else None
+        if response.is_success and business_code in {None, 0, "0"}:
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            request_id = (
+                str(payload.get("request_id"))
+                if isinstance(payload, dict) and payload.get("request_id")
+                else None
+            )
+            return TikTokResult(data=data, request_id=request_id)
+        failure = classify_failure(
+            http_status=response.status_code,
+            business_code=business_code,
+            retry_after=response.headers.get("Retry-After"),
+        )
+        raise TikTokClientError(failure, endpoint_key=selected.key)
 
     @staticmethod
     def _decode_json(response: httpx.Response) -> Any:

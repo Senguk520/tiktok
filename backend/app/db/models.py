@@ -171,6 +171,34 @@ class ProductDraft(Base, TimestampMixin):
     human_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+class ProductImageAsset(Base, TimestampMixin):
+    __tablename__ = "product_image_assets"
+    __table_args__ = (
+        UniqueConstraint("product_draft_id", "source_ref_hash", name="uq_image_draft_source"),
+        CheckConstraint("byte_size > 0", name="image_positive_size"),
+        CheckConstraint(
+            "upload_state IN ('VALIDATING','SUBMITTED','ACTIVE','FAILED')",
+            name="image_upload_state_allowed",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    product_draft_id: Mapped[str] = mapped_column(
+        ForeignKey("product_drafts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_ref_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    tiktok_image_id: Mapped[str | None] = mapped_column(String(255))
+    upload_state: Mapped[str] = mapped_column(
+        String(32), default=WriteState.VALIDATING.value, nullable=False
+    )
+    platform_request_id: Mapped[str | None] = mapped_column(String(128))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_redacted: Mapped[str | None] = mapped_column(Text)
+
+
 class ProductLink(Base, TimestampMixin):
     __tablename__ = "product_links"
     __table_args__ = (

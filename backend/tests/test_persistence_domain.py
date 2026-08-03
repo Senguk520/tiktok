@@ -61,13 +61,18 @@ async def test_migrations_are_versioned_and_idempotent() -> None:
     core_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     collector_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
-        assert await migrate_core(core_engine) == (1,)
+        assert await migrate_core(core_engine) == (1, 2)
         assert await migrate_core(core_engine) == ()
         assert await migrate_collector(collector_engine) == (1,)
         assert await migrate_collector(collector_engine) == ()
         async with core_engine.connect() as connection:
             names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
-        assert {"shop_binding", "idempotent_operations", "core_schema_migrations"} <= names
+        assert {
+            "shop_binding",
+            "idempotent_operations",
+            "product_image_assets",
+            "core_schema_migrations",
+        } <= names
         async with collector_engine.connect() as connection:
             names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
         assert {"collector_jobs", "image_records", "collector_schema_migrations"} <= names

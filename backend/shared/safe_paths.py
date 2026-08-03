@@ -254,6 +254,38 @@ def _sniff_image_mime(header: bytes) -> str | None:
     return None
 
 
+def validate_image_bytes(
+    filename: str,
+    *,
+    content_type: str,
+    content: bytes,
+) -> str:
+    """Validate an in-memory image before sending it to an upstream API.
+
+    The original client path is never accepted: callers provide one basename,
+    and only its validated basename is forwarded as multipart metadata.
+    """
+
+    raw = Path(filename)
+    if (
+        not filename
+        or raw.is_absolute()
+        or len(raw.parts) != 1
+        or raw.name in {"", ".", ".."}
+    ):
+        raise InvalidImageError("image filename must be a single basename")
+    extension = raw.suffix.lower()
+    expected_mime = IMAGE_MIME_BY_EXTENSION.get(extension)
+    normalized_mime = content_type.split(";", 1)[0].strip().lower()
+    if expected_mime is None or normalized_mime != expected_mime:
+        raise InvalidImageError("image MIME type does not match an allowed extension")
+    if not content or len(content) > MAX_IMAGE_BYTES:
+        raise InvalidImageError("image is empty or exceeds the maximum size")
+    if _sniff_image_mime(content[:16]) != expected_mime:
+        raise InvalidImageError("image content does not match extension")
+    return raw.name
+
+
 def validate_image_file(
     filename: str | os.PathLike[str] | Path,
     *,

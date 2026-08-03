@@ -41,6 +41,13 @@ class MarketProductStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class ProductDraftStatus(StrEnum):
+    DRAFT = "DRAFT"
+    READY = "READY"
+    SUBMITTED = "SUBMITTED"
+    ARCHIVED = "ARCHIVED"
+
+
 class WriteState(StrEnum):
     VALIDATING = "VALIDATING"
     QUEUED = "QUEUED"

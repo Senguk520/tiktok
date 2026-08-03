@@ -24,6 +24,13 @@ class IdempotencyPolicy(StrEnum):
     PLATFORM_CONFIRMED = "PLATFORM_CONFIRMED"
 
 
+class ProductImageUseCase(StrEnum):
+    MAIN_IMAGE = "MAIN_IMAGE"
+    DESCRIPTION_IMAGE = "DESCRIPTION_IMAGE"
+    CERTIFICATION_IMAGE = "CERTIFICATION_IMAGE"
+    SIZE_CHART_IMAGE = "SIZE_CHART_IMAGE"
+
+
 @dataclass(frozen=True, slots=True)
 class Endpoint:
     key: str
@@ -110,6 +117,14 @@ _ITEMS = (
         Scope.LOGISTICS,
         write=False,
         retry=RetryPolicy.SAFE_READ,
+    ),
+    _endpoint(
+        "product.image.upload",
+        "POST",
+        "/product/202309/images/upload",
+        Scope.PRODUCT_WRITE,
+        write=True,
+        retry=RetryPolicy.NEVER,
     ),
     _endpoint(
         "local.create",

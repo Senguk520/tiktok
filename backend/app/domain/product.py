@@ -61,3 +61,7 @@ class NormalizedProduct:
             and not self.unmapped_warnings
             and all(sku.inventory_by_warehouse for sku in self.skus)
         )
+
+    @property
+    def ready_for_platform_submission(self) -> bool:
+        return self.ready_for_listing and all(image.local_image_id for image in self.images)
