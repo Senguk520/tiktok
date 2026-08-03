@@ -29,7 +29,7 @@ _CJ_INPUT_HOSTS = frozenset(
         "developers.cjdropshipping.com",
     }
 )
-_PRODUCT_ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+_PRODUCT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class CjOfficialApiAdapter:

@@ -24,6 +24,7 @@ from typing import Final
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 DATA_DIR: Final[Path] = PROJECT_ROOT / "data"
 IMAGE_DIR: Final[Path] = PROJECT_ROOT / "temp" / "images"
+COLLECTOR_IMAGE_DIR: Final[Path] = IMAGE_DIR / "collector"
 CONFIG_DIR: Final[Path] = PROJECT_ROOT / "config"
 
 MAX_IMAGE_BYTES: Final[int] = 10 * 1024 * 1024
@@ -141,10 +142,12 @@ def resolve_project_path(value: str | os.PathLike[str] | Path) -> Path:
 
 
 def ensure_runtime_directories() -> tuple[Path, Path]:
-    """Create only the two approved runtime directories.
+    """Create only the approved database and image runtime directories.
 
-    No caller receives a generic directory-creation primitive.  Existing
-    symlinks/reparse points are rejected before and after creation.
+    No caller receives a generic directory-creation primitive. Existing
+    symlinks/reparse points are rejected before and after creation. Collector
+    images are isolated below ``temp/images/collector`` while the return shape
+    remains compatible with existing callers.
     """
 
     data_dir = resolve_project_path(DATA_DIR)
@@ -155,6 +158,9 @@ def ensure_runtime_directories() -> tuple[Path, Path]:
     image_dir = resolve_project_path(IMAGE_DIR)
     image_dir.mkdir(exist_ok=True)
     resolve_project_path(image_dir)
+    collector_image_dir = resolve_project_path(COLLECTOR_IMAGE_DIR)
+    collector_image_dir.mkdir(exist_ok=True)
+    resolve_project_path(collector_image_dir)
     return data_dir, image_dir
 
 
@@ -183,17 +189,32 @@ def resolve_image_path(value: str | os.PathLike[str] | Path) -> Path:
     return path
 
 
+def resolve_collector_image_path(value: str | os.PathLike[str] | Path) -> Path:
+    """Resolve one UUID-named Collector image below its dedicated directory."""
+
+    path = resolve_project_path(value)
+    image_dir = COLLECTOR_IMAGE_DIR.resolve(strict=False)
+    if path.parent != image_dir or not UUID_IMAGE_RE.fullmatch(path.name):
+        raise InvalidImageError("collector image must be UUID.ext under temp/images/collector")
+    if path.suffix.lower() not in IMAGE_MIME_BY_EXTENSION:
+        raise InvalidImageError("collector image extension is not allowed")
+    return path
+
+
 def resolve_runtime_path(value: str | os.PathLike[str] | Path) -> Path:
-    """Resolve a runtime path only when it is a database or image path."""
+    """Resolve a runtime path only when it is a database or approved image path."""
 
     path = resolve_project_path(value)
     try:
         return resolve_sqlite_path(path)
     except UnsafePathError:
+        pass
+    for resolver in (resolve_image_path, resolve_collector_image_path):
         try:
-            return resolve_image_path(path)
-        except InvalidImageError as exc:
-            raise UnsafePathError("runtime path is not an approved database or image") from exc
+            return resolver(path)
+        except InvalidImageError:
+            continue
+    raise UnsafePathError("runtime path is not an approved database or image")
 
 
 def resolve_config_path(

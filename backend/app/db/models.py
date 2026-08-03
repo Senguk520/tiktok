@@ -171,6 +171,30 @@ class ProductDraft(Base, TimestampMixin):
     human_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+class CollectorImportReceipt(Base):
+    __tablename__ = "collector_import_receipts"
+    __table_args__ = (
+        UniqueConstraint("shop_binding_id", "result_id", name="uq_collector_receipt_shop_result"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    shop_binding_id: Mapped[str] = mapped_column(
+        ForeignKey("shop_binding.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    result_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    job_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_product_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    envelope_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    product_draft_id: Mapped[str] = mapped_column(
+        ForeignKey("product_drafts.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    contract_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class ProductImageAsset(Base, TimestampMixin):
     __tablename__ = "product_image_assets"
     __table_args__ = (

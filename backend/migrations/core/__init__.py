@@ -57,10 +57,15 @@ async def _normalized_order_records(connection: AsyncConnection) -> None:
     await _create_tables(connection, ("order_records", "order_line_records"))
 
 
+async def _collector_import_receipts(connection: AsyncConnection) -> None:
+    await _create_tables(connection, ("collector_import_receipts",))
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration(version=1, name="initial_core_business_schema", apply=_initial_schema),
     Migration(version=2, name="product_image_asset_registry", apply=_product_image_assets),
     Migration(version=3, name="normalized_order_records", apply=_normalized_order_records),
+    Migration(version=4, name="collector_import_receipts", apply=_collector_import_receipts),
 )
 
 

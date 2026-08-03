@@ -28,6 +28,7 @@ frontend/dist/
 *.sqlite3-shm
 *.sqlite3-wal
 data/
+temp/
 
 # Secrets and local configuration
 .env
