@@ -1,0 +1,361 @@
+# TikTok Shop 东南亚 Custom App API 可行性报告
+
+> 评估日期：2026-07-31  
+> 业务口径：中国跨境卖家、覆盖东南亚、以马来西亚为主  
+> 固定前提：Seller Developer、Custom App、仅连接本人已激活店铺；浏览器插件不保存 TikTok `app_secret`、Access Token 或 Refresh Token。
+
+## 1. 最终结论
+
+**结论：条件可实现。**
+
+商品读取、订单读取、马来西亚本地商品创建与维护，在 Custom App 获得相应 Public Scope、卖家完成授权、目标店铺已激活并完成 KYC 后，均有官方 API 支持。跨东南亚复制同样有 API 基础，但必须先确定卖家当前采用哪一种刊登模式，再选择唯一写入链路：
+
+1. **已迁移 Local Replication**：使用 Local Product API；跨市场同步通过 `replicated_products` 及各市场 Local Product 实体完成。
+2. **未迁移 Global Product**：使用 Global Product API 创建并发布，发布后再用 Local Product API 管理各市场本地价格、库存和上下架。
+
+这两条链路不能拼接成一个“失败就切另一套接口”的流程。是否迁移、市场是否可发布、Scope 是否真实获批、店铺资质、商品审核以及 Seller Center 配额，都是运行时门槛，API 不能绕过。
+
+### 1.1 能力判定
+
+| 能力 | 判定 | 主要前提 |
+| --- | --- | --- |
+| 查询本地商品与详情 | 可实现 | `seller.product.basic`；有效店铺授权与 `shop_cipher` |
+| 创建、编辑本地商品 | 条件可实现 | `seller.product.write`；店铺 Active、KYC、类目/语言/仓库资料合规 |
+| 更新本地价格、库存 | 条件可实现 | `seller.product.write`；满足商品状态、促销和仓库约束 |
+| 上下架、删除本地商品 | 条件可实现 | `seller.product.basic` / `seller.product.delete`；满足状态约束 |
+| 读取订单列表与详情 | 可实现 | `seller.order.info`；订单列表仍为 `202309`，详情当前为 `202507` |
+| Local Replication 跨市场刊登 | 条件可实现 | 卖家已迁移；各目标市场店铺有效；提交完整复制数据 |
+| 旧 Global Product 跨市场刊登 | 条件可实现，仅限未迁移卖家 | Global Product 三组 Scope；Global 功能与目标市场资格仍有效 |
+| 仅靠浏览器插件直连 TikTok API | 不可接受 | 会暴露 `app_secret`、Token 与签名能力 |
+| 绕过新店刊登额度、审核或 KYC | 不可实现 | 属于 Seller Center/平台治理限制，不是 API 限流 |
+
+## 2. 证据口径
+
+本报告将证据分为三类：
+
+- **已核验**：Partner Center API Reference / Developer Guide 或马来西亚 TikTok Shop Academy 当前正文明确给出。
+- **官方异常**：官方页面存在，但元数据与正文不一致或正文仍是占位内容；不能作为生产基线。
+- **账户级待核验**：只能在目标 App 的 `Manage API`、OAuth `granted_scopes`、Seller Center 或实际 API 响应中确认。
+
+`Public Scope` 表示该 API 权限包面向开发者公开，不表示“仅 Public App 可用”。Custom App 与 Public App 是应用分发方式；两者不是同一维度。
+
+## 3. 商品接口矩阵
+
+### 3.1 已迁移：Local Product / Local Replication
+
+| 能力 | Method 与当前路径 | Scope Key | 关键边界 |
+| --- | --- | --- | --- |
+| 创建 | `POST /product/202309/products` | `seller.product.write` | 仅 `AVAILABLE` 类目；创建后审核；适用于所有卖家，已迁移全球卖家可用于 Local Replication；东南亚商品正文不得直接使用中文替代目标市场语言 |
+| 全量编辑 | `PUT /product/202509/products/{product_id}` | `seller.product.write` | 不支持 `FREEZE`、`DELETED`；仅 Active 且完成 KYC 的店铺；空值也会覆盖，建议先 Get 后提交完整对象；价格/库存省略时保持不变 |
+| 部分编辑 | `POST /product/202509/products/{product_id}/partial_edit` | `seller.product.write` | 不支持 `FREEZE`、`DELETED`；按顶层属性更新，但修改嵌套对象时必须提交该对象完整非空字段 |
+| 搜索 | `POST /product/202502/products/search` | `seller.product.basic` | 返回关键字段；`page_size` 1–100；`sku_ids` 最多 10；状态过滤针对商品 base version，不覆盖 post-live drafts/edits；再用 Get 取完整详情 |
+| 详情 | `GET /product/202309/products/{product_id}` | `seller.product.basic` | 不返回 `FREEZE` 或 `DELETED` 商品 |
+| 价格 | `POST /product/202309/products/{product_id}/prices/update` | `seller.product.write` | 商品必须为 `ACTIVATE`，且不能处于进行中的促销；一次请求更新该商品内多个 SKU |
+| 库存 | `POST /product/202309/products/{product_id}/inventory/update` | `seller.product.write` | SKU 所属商品不得为 `FREEZE` 或 `DELETED`；按仓库更新 |
+| 激活 | `POST /product/202309/products/activate` | `seller.product.basic` | 仅 `SELLER_DEACTIVATED` / `PLATFORM_DEACTIVATED`；提交后进入 `PENDING` 审核；最多 20 个商品 ID |
+| 下架 | `POST /product/202309/products/deactivate` | `seller.product.basic` | 仅 `ACTIVATE`；成功后为 `SELLER_DEACTIVATED`；最多 20 个商品 ID |
+| 删除 | `DELETE /product/202309/products` | `seller.product.delete` | 仅非冻结商品；最多 20 个商品 ID |
+
+Local Replication 的同步规则需要在编排层显式实现：
+
+- 全量编辑如需同步到其他市场，要提交 `seller_sku` 和完整 `replicated_products`。
+- 类目变化、销售属性 ID/名称变化必须同步，否则 API 会失败。
+- 部分编辑中，销售属性变化必须带 `seller_sku` 与完整 `replicated_products`；一般字段变更可仅指定目标 `replicated_products.region`。
+- 内容修改通常触发新版本审核；价格和库存修改不要求重新审核并立即生效。
+
+### 3.2 未迁移：Global Product
+
+| 能力 | Method 与当前路径 | Scope Key | 关键边界 |
+| --- | --- | --- | --- |
+| 创建全球商品 | `POST /product/202309/global_products` | `seller.global_product.write` | 仅全球卖家/欧盟内部卖家；仅 `AVAILABLE` 类目；创建后还需 Publish |
+| 发布到市场 | `POST /product/202309/global_products/{global_product_id}/publish` | `seller.global_product.write` | 将 Global Product 转为目标市场 Local Product 并分别审核；每个市场只可发布一次 |
+| 全量编辑 | `PUT /product/202309/global_products/{global_product_id}` | `seller.global_product.write` | 已发布商品会重新翻译并同步全部已发布市场，覆盖 Local Product 的本地定制信息，包含本地价格 |
+| 搜索 | `POST /product/202312/global_products/search` | `seller.global_product.info` | `page_size` 1–100；返回关键字段 |
+| 详情 | `GET /product/202309/global_products/{global_product_id}` | `seller.global_product.info` | 支持 `DRAFT`、`UNPUBLISHED`、`PUBLISHED`，并返回已发布市场的 Local Product ID |
+| 删除 | `DELETE /product/202309/global_products` | `seller.global_product.delete` | 最多 20 个 Global Product ID |
+| 更新全球库存 | `POST /product/202309/global_products/{global_product_id}/inventory/update` | `seller.global_product.write` | 仅未发布商品且需 Multi-Warehouse 权限；不会影响已发布商品 |
+
+**发布后的边界**：Global Product 是跨市场源实体，发布后生成 Local Product。已发布商品的本地价格、库存、上下架必须使用 Local Product 接口。调用 Global Edit 会覆盖已做的本地定制，因此需要高风险确认或变更锁。
+
+### 3.3 官方异常：Partial Edit Global Product 202509
+
+官方页面给出的路径是：
+
+`PUT /product/202509/global_products/{global_product_id}/partial_edit`
+
+但当前官方证据存在两处冲突：
+
+1. Function Description 仍是占位文本：`Description of [POST]/product/:version/Partial_Edit_Global_Product`，并与页面声明的 `PUT` 不一致。
+2. API 元数据将写接口 Scope 标为 `seller.product.basic`，而不是 Global Product 写 Scope。
+
+因此该接口只能列为**官方异常、待平台确认**，不纳入 MVP 或生产写入链路。上线前应以目标 App 的 `Manage API`、API Testing Tool 以及平台支持回复三方确认 Method、Scope 和卖家适用范围。
+
+## 4. 订单与前置接口
+
+| 能力 | Method 与当前路径 | Scope Key | 上限/用途 |
+| --- | --- | --- | --- |
+| 授权店铺 | `GET /authorization/202309/shops` | `seller.authorization.info` | 获取授权店铺、区域、卖家类型与 `cipher` |
+| 仓库列表 | `GET /logistics/202309/warehouses` | `seller.logistics` | 创建/库存更新前获取有效仓库 |
+| 仓库配送选项 | `GET /logistics/202309/warehouses/{warehouse_id}/delivery_options` | `seller.logistics` | SEA（含 MY）创建商品时可用于获取 `delivery_option_ids`；接口业务参数可使用 `scope=PRODUCT`，它不是 OAuth Scope Key |
+| 订单列表 | `POST /order/202309/orders/search` | `seller.order.info` | 当前文档树中的列表版本仍为 `202309`；`page_size` 1–100，默认 20；使用 `page_token` |
+| 订单详情 | `GET /order/202507/orders` | `seller.order.info` | 当前详情版本为 `202507`；`ids` 最多 50 |
+
+不要为了“统一版本号”自行把订单列表拼成 `202507` 路径。TikTok Shop 按端点独立版本化，当前官方文档树就是列表 `202309`、详情 `202507`。
+
+## 5. Scope 与 Custom App 边界
+
+### 5.1 最小 Scope 集合
+
+Local Replication、商品与订单基础能力：
+
+- `seller.authorization.info`
+- `seller.product.basic`
+- `seller.product.write`
+- `seller.product.delete`
+- `seller.order.info`
+- `seller.logistics`
+
+仅未迁移 Global Product 链路追加：
+
+- `seller.global_product.info`
+- `seller.global_product.write`
+- `seller.global_product.delete`
+
+上述正式目标端点的官方权限包均标为 `Public`。官方 Access Scope 文档说明，Public Scope API 面向所有开发者；创建 App 后默认可访问 Public Scope API，但访问具体店铺数据前仍须卖家授权。Custom Scope 才需要在 Partner Center 单独申请敏感权限。
+
+### 5.2 应用类型边界
+
+- Custom App 通过发布后生成的 Authorize Link 私下分发，不在 App & Service Store 公开展示。
+- Seller Authorization Link 同时适用于 Custom App 和 Public App；Seller Center App Store 安装仅适用于 Public App。
+- Custom App 的最低上线前提通常包含 Registration Review；Connector 类别、达到 25 个及以上卖家授权或被平台标记时，可能需要额外 App Review / Beta Testing。
+- 本项目“只绑定本人店铺”不等于免审。以 Partner Center 实际检查清单为准。
+- 每次 Token 响应返回的 `granted_scopes` 才是该次授权的最终事实。后端必须与期望 Scope 做差集检查，缺少权限时阻断功能，而不是等业务请求报错。
+
+## 6. OAuth、签名与安全边界
+
+### 6.1 授权链路
+
+1. 后端生成不可预测、单次使用且有短过期时间的 `state`，保存授权事务。
+2. ROW 卖家打开：`https://services.tiktokshop.com/open/authorize?service_id={service_id}`。
+3. 回调收到 `code` 与 `state`；拒绝授权时 `code=null&error=auth_denied`。
+4. `auth_code` 仅 30 分钟有效且只能使用一次，后端立即调用 `https://auth.tiktok-shops.com/api/v2/token/get`。
+5. 获取 `access_token`、`refresh_token`、`open_id`、`user_type`、过期时间和 `granted_scopes`。
+6. Access Token 默认有效期为 7 天；Refresh Token 到期时间等于卖家授予的授权期限。按响应中的 Unix 到期时间调度刷新，不硬编码日期。
+7. 调用 `GET /authorization/202309/shops` 获取授权店铺及 `cipher`；店铺 API 将其作为 `shop_cipher`。
+8. 订阅即将到期授权与 Seller Deauthorization Webhook。去授权后立即停止任务并撤销本地 Token 可用状态。
+
+TikTok Token API 的换码参数是 `grant_type=authorized_code`，不是标准拼写 `authorization_code`；刷新使用 `grant_type=refresh_token`。
+
+### 6.2 API 请求认证
+
+`202309` 及以后版本：
+
+- Access Token 放在 `x-tts-access-token` 请求头，不参与签名。
+- Query 至少包含 `app_key`、`timestamp`、`sign`；店铺接口按文档加入 `shop_cipher`。
+- 签名使用 `app_secret` 作为 HMAC-SHA256 密钥。
+- 排除 `sign` 和遗留 Query 参数 `access_token`，其余 Query Key 按字母排序并拼接 `{key}{value}`。
+- 签名原文为：请求路径 + 排序参数串 + 请求正文；再以前后各一个 `app_secret` 包裹，最后做 HMAC-SHA256 并输出十六进制。
+- `multipart/form-data` 不把正文加入签名；其他 Content-Type 必须签署**最终发送的原始正文字节**，签名后不得重新序列化 JSON。
+- `timestamp` 必须是 10 位 Unix 秒，并在平台收到请求时与当前时间相差不超过 5 分钟。
+
+### 6.3 必须落在后端的职责
+
+- `app_secret`、Access Token、Refresh Token 的保存、刷新与轮换。
+- OAuth 回调、`state` 校验、授权主体与自有账号绑定。
+- HMAC 生成与 TikTok API 调用。
+- Scope 校验、店铺/市场/`shop_cipher` 映射。
+- 限流、重试、幂等、审计、脱敏与告警。
+
+浏览器插件只保存自有系统的短期会话，不接触 TikTok 密钥。Token 与 `app_secret` 使用 KMS/密钥管理系统包裹加密；数据库仅存密文和密钥版本。日志禁止记录 Token、`app_secret`、完整授权回调 URL、签名原文中的敏感正文或买家个人信息。Token API 把 `app_secret` 放在 Query 参数中，HTTP 客户端、代理和 APM 必须关闭完整 URL 记录或做参数级脱敏。
+
+## 7. 平台限制
+
+### 7.1 API 动态限流
+
+官方 Rate Limits 文档说明 TikTok Shop 使用动态 QPS 分配，受授权店铺规模、端点资源特征、实时平台负载和保护规则影响；不存在覆盖所有端点的固定 QPS 查询 API。本报告核对的目标端点 Reference 未发布可作为承诺值的固定 QPS。
+
+处理规则：
+
+- HTTP `429` 或业务码 `36009002` 任意一个出现，都按限流处理。
+- 有 `Retry-After` 时优先遵守；否则指数退避并加入随机抖动。
+- `503` 是服务不可用，不与 `429` 混为一个错误类别。
+- 限流器至少按 App × Shop × Endpoint × Operation Type 隔离；不能用一个全局 QPS 常量。
+- 写操作只有在具备业务幂等键或等价防重机制时才能自动重试。
+- 官方 Rate Limits 页给出的“建议初始发送速率”只是客户端压测起点，不是平台额度，报告不把它们写成 SLA。
+
+### 7.2 已核验的请求规模
+
+- Local / Global 商品搜索：每页 1–100。
+- 订单列表：每页 1–100，默认 20。
+- 订单详情：一次最多 50 个订单 ID。
+- 激活、下架、删除 Local Product：一次最多 20 个商品 ID。
+- 删除 Global Product：一次最多 20 个 Global Product ID。
+- Create Product 在东南亚等“其他区域”单商品最多 100 个 SKU。
+- Search Products 的 `sku_ids` 过滤最多 10 个。
+
+### 7.3 马来西亚新店调整期
+
+马来西亚 TikTok Shop Academy 官方文章《Tempoh Penyesuaian Kedai Baru》页面显示日期 `04/03/2026`，适用范围明确为 Malaysia，并写明所有新店都会进入调整期：
+
+| 阶段 | 每日订单上限 | 商品上传/刊登上限 | 自动升级条件 |
+| --- | ---: | ---: | --- |
+| Pemula（初级） | 100 | 1,000 | 完成店铺注册后自动进入 |
+| Standard | 200 | 2,000 | 至少 10 个已发布 Listing；通过新卖家测验；近 30 天少于 5 次合规违规；近 60 天店铺评分至少 2.5 |
+| Premium | 300 | 3,000 | 近 30 天少于 3 次合规违规；注册至少 30 天；近 60 天评分至少 3.0；累计至少 100 个已完成订单；至少 10 个独立买家 |
+| Pro | 文章未给固定数值 | 文章未给固定数值 | 近 30 天少于 1 次合规违规；注册至少 30 天；近 60 天评分至少 3.5；累计至少 200 个已完成订单；至少 20 个独立买家 |
+
+严格解释：
+
+- 1,000 / 2,000 / 3,000 是新店调整计划中的商品上传/刊登上限，不是 API QPS，也不能直接解释成“每天可调用 Create Product 的次数”。
+- Pro 表示完成调整期。文章明确写明 Pro 不再受该计划的**每日订单上限**约束，但没有给出一个“无限商品数”的数值承诺。因此仍以 Seller Center 中实时显示的 `Had penyenaraian` 为准。
+- 页面显示的额度是马来西亚店铺规则，不能自动外推到泰国、越南、菲律宾、新加坡或印尼。
+- API 调用成功也不能绕过 Seller Center 的阶段额度、类目准入、品牌/认证要求、KYC、仓库、语言或商品审核。
+
+## 8. 推荐架构
+
+```mermaid
+flowchart LR
+  P[浏览器插件] -->|自有登录 + HTTPS| G[自建业务 API]
+  G --> A[OAuth 与授权服务]
+  G --> R[店铺/市场与刊登模式注册表]
+  G --> O[商品复制编排器]
+  G --> D[订单同步服务]
+  O --> Q[按店铺/端点隔离的任务队列]
+  D --> Q
+  Q --> C[TikTok API Client 与签名器]
+  A --> K[(加密 Token 存储)]
+  R --> B[(业务数据库)]
+  C --> T[TikTok Shop Open API ROW]
+  T --> W[Webhook 接收器]
+  W --> O
+  W --> D
+```
+
+### 8.1 模块职责
+
+- **OAuth 与授权服务**：授权事务、Token 换取/刷新、Scope 差集、去授权处理。
+- **店铺/市场注册表**：`open_id`、`user_type`、店铺 ID、区域、`shop_cipher`、店铺状态、刊登模式和 Scope 快照。
+- **商品复制编排器**：只接收规范化商品意图，不直接接受任意 TikTok 请求；根据刊登模式选择唯一 Gateway。
+- **Local Product Gateway**：封装 Local Product、Local Replication、价格、库存和上下架。
+- **Global Product Gateway**：只服务未迁移卖家；禁止被 Local 流程当作失败兜底。
+- **订单同步服务**：游标分页、增量时间窗、详情批量 50 条、Webhook 对账。
+- **队列与限流器**：按 App/Shop/Endpoint/操作类型分片，支持退避、抖动、熔断与死信。
+- **审计与可观测性**：记录 `request_id`、内部任务 ID、端点、店铺、区域、耗时和脱敏错误码，不记录凭据或个人信息正文。
+
+### 8.2 核心数据结构
+
+```text
+SellerAuthorization {
+  openId, userType, baseRegion,
+  grantedScopes, accessTokenRef, refreshTokenRef,
+  accessExpiresAt, refreshExpiresAt, status
+}
+
+ShopBinding {
+  shopId, shopCode, region, sellerType, shopCipherRef,
+  shopStatus, kycStatus,
+  listingMode: LOCAL_REPLICATION | GLOBAL_LEGACY | UNKNOWN
+}
+
+ProductLink {
+  sourceProductId, sellerSku,
+  globalProductId?,
+  localProductByRegion: Map<Region, ProductId>,
+  lastSyncedVersion, syncPolicy
+}
+```
+
+`listingMode=UNKNOWN` 时所有商品写操作必须失败关闭（fail closed），由运营或资格探测流程确认后才能继续。
+
+### 8.3 写入路由
+
+```text
+routeListing(shop, intent) =
+  match shop.listingMode:
+    LOCAL_REPLICATION -> localReplicationWorkflow(intent)
+    GLOBAL_LEGACY     -> globalProductWorkflow(intent)
+    UNKNOWN           -> reject("listing mode not verified")
+```
+
+推荐状态机：
+
+`VALIDATING → QUEUED → SUBMITTED → AUDITING → ACTIVE | FAILED`
+
+其中价格/库存可从 `SUBMITTED` 直接进入 `ACTIVE`；内容编辑必须等待 Webhook 或状态回查。每个市场单独保存状态，禁止用一个“全区成功”布尔值掩盖部分市场失败。
+
+## 9. 上线门槛与风险
+
+### 9.1 Go / No-Go 检查点
+
+满足以下条件可启动马来西亚 PoC：
+
+1. Partner Center 已发布 Custom App，并完成实际要求的 Registration / Compliance Review。
+2. `Manage API` 可选择最小 Scope；OAuth 响应 `granted_scopes` 无缺口。
+3. `Get Authorized Shops` 返回目标 MY 店铺，店铺 Active、KYC 完成且仓库可用。
+4. 已确认 `listingMode`，并用单一模式完成“创建 → 审核 → 查询 → 改价 → 改库存 → 下架”的端到端测试。
+5. Seller Center 已记录当前调整期阶段和实时刊登额度。
+6. 已完成签名原始字节测试、Token 刷新测试、429/503 分类重试测试和去授权测试。
+
+以下情况应 No-Go：
+
+- 计划让插件保存 `app_secret` 或直接生成 TikTok 签名。
+- 无法确认卖家迁移状态，却准备同时尝试 Local 与 Global 创建。
+- 把 `Partial Edit Global Product 202509` 当作生产核心接口，但尚未确认其异常 Scope/正文。
+- 业务吞吐依赖一个未经实测的固定 QPS。
+- 目标是绕过 Seller Center 商品额度、审核、KYC 或市场准入。
+
+### 9.2 主要风险
+
+| 优先级 | 风险 | 控制措施 |
+| --- | --- | --- |
+| 高 | 混用 Local Replication 与 Global Legacy，产生重复商品或关系断裂 | `listingMode` 强类型路由；未知状态失败关闭；分离 Gateway 与任务类型 |
+| 高 | Global Edit 覆盖各市场本地价格和翻译 | 默认禁用已发布 Global 全量编辑；变更预览、人工确认、按市场备份 |
+| 高 | 插件或日志泄露密钥/Token/买家数据 | 后端签名、KMS 包裹加密、字段级脱敏、最小保留期 |
+| 高 | MY 新店额度与审核导致批量刊登失败 | 读取 Seller Center 实时额度；按优先级排队；逐市场状态与告警 |
+| 中 | 动态限流造成同步积压 | 分片限流、批量、游标增量、退避抖动、积压告警 |
+| 中 | 全量/部分编辑的嵌套覆盖语义导致数据丢失 | Get-merge-write、Schema 校验、版本快照、差异预览 |
+| 中 | 官方端点版本独立演进 | Endpoint Registry；发布前重新抓取 Reference；契约测试 |
+
+## 10. 账户级待核验项
+
+以下内容不能仅靠公共文档替代目标账户验证：
+
+- Custom App 的实际审核清单、目标市场和卖家类型是否匹配。
+- `Manage API` 中 Scope 是否可选，OAuth `granted_scopes` 是否完整。
+- 目标跨境卖家当前是 Local Replication 还是 Global Legacy，以及 Global Product 市场资格。
+- 各东南亚目标店铺的激活/KYC/仓库/类目/品牌/认证状态。
+- Seller Center 当前 `Had penyenaraian`、阶段和剩余额度。
+- 各目标端点的实测稳定吞吐；不存在可预先承诺的固定 QPS。
+- `Partial Edit Global Product 202509` 的真实 Scope 与生产可用性。
+
+## 11. 官方来源
+
+Partner Center：
+
+- [Overview / API 分类](https://partner.tiktokshop.com/docv2/page/products-api-overview)
+- [Access Scope](https://partner.tiktokshop.com/docv2/page/access-scope)
+- [Publish a Custom App](https://partner.tiktokshop.com/docv2/page/publish-custom-app)
+- [Authorization Overview](https://partner.tiktokshop.com/docv2/page/authorization-overview-202407)
+- [Seller Authorization Guide](https://partner.tiktokshop.com/docv2/page/seller-authorization-guide)
+- [Sign Your API Request](https://partner.tiktokshop.com/docv2/page/sign-your-api-request)
+- [Rate Limits](https://partner.tiktokshop.com/docv2/page/rate-limits)
+- [Get Authorized Shops](https://partner.tiktokshop.com/docv2/page/get-authorized-shops-202309)
+- [Create Product](https://partner.tiktokshop.com/docv2/page/create-product-202309)
+- [Edit Product 202509](https://partner.tiktokshop.com/docv2/page/edit-product-202509)
+- [Partial Edit Product 202509](https://partner.tiktokshop.com/docv2/page/partial-edit-product-202509)
+- [Search Products 202502](https://partner.tiktokshop.com/docv2/page/search-products-202502)
+- [Get Product](https://partner.tiktokshop.com/docv2/page/get-product-202309)
+- [Update Price](https://partner.tiktokshop.com/docv2/page/update-price-202309)
+- [Update Inventory](https://partner.tiktokshop.com/docv2/page/update-inventory-202309)
+- [Create Global Product](https://partner.tiktokshop.com/docv2/page/create-global-product-202309)
+- [Publish Global Product](https://partner.tiktokshop.com/docv2/page/publish-global-product-202309)
+- [Edit Global Product](https://partner.tiktokshop.com/docv2/page/edit-global-product-202309)
+- [Partial Edit Global Product 202509](https://partner.tiktokshop.com/docv2/page/partial-edit-global-product-202509)
+- [Get Order List](https://partner.tiktokshop.com/docv2/page/get-order-list-202309)
+- [Get Order Detail 202507](https://partner.tiktokshop.com/docv2/page/get-order-detail-202507)
+
+马来西亚 TikTok Shop Academy：
+
+- [Tempoh Penyesuaian Kedai Baru](https://seller-my.tiktok.com/university/essay?knowledge_id=7753773296633601&role=1&course_type=1&from=search)
+
+文档更新时间核验样例：主要商品端点于 2026-07-21 至 2026-07-30 更新；订单详情于 2026-07-30 更新；签名与 Rate Limits 文档于 2026-07-06 更新。Global Partial Edit 页面更新时间为 2025-11-03，且仍存在上述异常。所有时间均来自官方响应中的 `update_time` Unix 时

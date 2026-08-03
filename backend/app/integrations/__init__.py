@@ -1,0 +1,1 @@
+"""Third-party integrations; no API route or persistence policy lives here."""

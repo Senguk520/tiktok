@@ -1,0 +1,1 @@
+"""Application use cases compose domain rules, repositories, and integrations."""

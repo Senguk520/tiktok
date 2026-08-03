@@ -1,0 +1,1 @@
+"""Collector API application package."""
