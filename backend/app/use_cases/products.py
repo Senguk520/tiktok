@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ProductDraft, ProductImageAsset, QuotaSnapshotModel
+from app.db.models import IdempotentOperation, ProductDraft, ProductImageAsset, QuotaSnapshotModel
 from app.domain.enums import ListingMode, OperationKind, ProductDraftStatus, WriteState
 from app.domain.product import NormalizedProduct
 from app.domain.product_payload import normalized_product_from_payload
@@ -78,6 +78,24 @@ class DraftSubmissionResult:
     submission: ProductSubmission
     operation_id: str
     replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDraftSubmission:
+    draft_id: str
+    operation_id: str
+    product: NormalizedProduct
+    quota_snapshot_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DraftSubmissionPreparation:
+    prepared: PreparedDraftSubmission | None = None
+    replayed: DraftSubmissionResult | None = None
+
+    def __post_init__(self) -> None:
+        if (self.prepared is None) == (self.replayed is None):
+            raise ValueError("submission preparation must be prepared or replayed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,14 +276,14 @@ class ProductService:
             confirmed_by_session_id=confirmed_by_session_id,
         )
 
-    async def submit_draft(
+    async def prepare_draft_submission(
         self,
         session: AsyncSession,
         context: ShopAccessContext,
         *,
         draft_id: str,
         idempotency_key: str,
-    ) -> DraftSubmissionResult:
+    ) -> DraftSubmissionPreparation:
         mode = context.require_listing_write()
         self._capabilities.require_submission()
         draft = await get_owned_draft(
@@ -296,14 +314,16 @@ class ProductService:
                 WriteState.AUDITING.value,
                 WriteState.ACTIVE.value,
             }:
-                return DraftSubmissionResult(
-                    submission=_submission_from_operation(
-                        context=context,
-                        result_reference=operation.result_reference,
-                        request_id=operation.platform_request_id,
-                    ),
-                    operation_id=operation.id,
-                    replayed=True,
+                return DraftSubmissionPreparation(
+                    replayed=DraftSubmissionResult(
+                        submission=_submission_from_operation(
+                            context=context,
+                            result_reference=operation.result_reference,
+                            request_id=operation.platform_request_id,
+                        ),
+                        operation_id=operation.id,
+                        replayed=True,
+                    )
                 )
             raise ProductSubmissionInProgress(
                 f"product submission already exists in state {operation.state}"
@@ -325,30 +345,65 @@ class ProductService:
                 region=context.region,
                 now=datetime.now(UTC),
             )
-        try:
-            operation.state = WriteState.SUBMITTED.value
-            submission = await self._gateway.create(context, product)
-        except BaseException as exc:
-            category = _failure_category(exc)
-            ambiguous = category is ErrorCategory.AMBIGUOUS_WRITE
-            operation.state = (
-                WriteState.MANUAL_REVIEW.value if ambiguous else WriteState.FAILED.value
+        operation.state = WriteState.SUBMITTED.value
+        return DraftSubmissionPreparation(
+            prepared=PreparedDraftSubmission(
+                draft_id=draft.id,
+                operation_id=operation.id,
+                product=product,
+                quota_snapshot_id=quota_snapshot_id,
             )
-            operation.manual_review_reason = (
-                "TikTok create result is ambiguous; reconcile by seller SKU before retry"
-                if ambiguous
-                else "TikTok create request failed before a confirmed result"
-            )
-            if quota_snapshot_id is not None and not ambiguous:
-                await release_listing_quota(session, snapshot_id=quota_snapshot_id)
-            raise
+        )
+
+    async def execute_draft_submission(
+        self,
+        context: ShopAccessContext,
+        prepared: PreparedDraftSubmission,
+    ) -> ProductSubmission:
+        return await self._gateway.create(context, prepared.product)
+
+    async def fail_draft_submission(
+        self,
+        session: AsyncSession,
+        prepared: PreparedDraftSubmission,
+        exc: BaseException,
+    ) -> None:
+        operation = await session.get(IdempotentOperation, prepared.operation_id)
+        if operation is None or operation.state != WriteState.SUBMITTED.value:
+            raise ProductSubmissionInProgress("product submission state changed before failure recording")
+        category = _failure_category(exc)
+        ambiguous = category is ErrorCategory.AMBIGUOUS_WRITE
+        operation.state = WriteState.MANUAL_REVIEW.value if ambiguous else WriteState.FAILED.value
+        operation.manual_review_reason = (
+            "TikTok create result is ambiguous; reconcile by seller SKU before retry"
+            if ambiguous
+            else "TikTok create request failed before a confirmed result"
+        )
+        if prepared.quota_snapshot_id is not None and not ambiguous:
+            await release_listing_quota(session, snapshot_id=prepared.quota_snapshot_id)
+
+    async def complete_draft_submission(
+        self,
+        session: AsyncSession,
+        context: ShopAccessContext,
+        prepared: PreparedDraftSubmission,
+        submission: ProductSubmission,
+    ) -> DraftSubmissionResult:
+        operation = await session.get(IdempotentOperation, prepared.operation_id)
+        draft = await get_owned_draft(
+            session,
+            shop_binding_id=context.shop_binding_id,
+            draft_id=prepared.draft_id,
+        )
+        if operation is None or operation.state != WriteState.SUBMITTED.value:
+            raise ProductSubmissionInProgress("product submission state changed before completion")
         operation.state = WriteState.AUDITING.value
         operation.platform_request_id = submission.request_id
         operation.result_reference = submission.product_id
         await record_product_submission(
             session,
             draft=draft,
-            mode=mode,
+            mode=context.listing_mode,
             region=context.region,
             product_id=submission.product_id,
             request_id=submission.request_id,
@@ -357,4 +412,35 @@ class ProductService:
             submission=submission,
             operation_id=operation.id,
             replayed=False,
+        )
+
+    async def submit_draft(
+        self,
+        session: AsyncSession,
+        context: ShopAccessContext,
+        *,
+        draft_id: str,
+        idempotency_key: str,
+    ) -> DraftSubmissionResult:
+        preparation = await self.prepare_draft_submission(
+            session,
+            context,
+            draft_id=draft_id,
+            idempotency_key=idempotency_key,
+        )
+        if preparation.replayed is not None:
+            return preparation.replayed
+        prepared = preparation.prepared
+        if prepared is None:  # pragma: no cover - guarded by the frozen value contract
+            raise RuntimeError("submission preparation is incomplete")
+        try:
+            submission = await self.execute_draft_submission(context, prepared)
+        except BaseException as exc:
+            await self.fail_draft_submission(session, prepared, exc)
+            raise
+        return await self.complete_draft_submission(
+            session,
+            context,
+            prepared,
+            submission,
         )

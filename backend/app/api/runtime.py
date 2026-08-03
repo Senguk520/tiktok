@@ -8,6 +8,12 @@ from typing import Any
 from app.integrations.tiktok.client import TikTokClient, TikTokConfig
 from app.integrations.tiktok.orders import TikTokOrderGateway
 from app.integrations.tiktok.products import TikTokProductGateway
+from app.integrations.translation import (
+    AzureTranslator,
+    AzureTranslatorConfig,
+    TranslationConfigurationBlocked,
+    TranslationProvider,
+)
 from app.use_cases.commerce_context import CommerceAccessBlocked
 from app.use_cases.orders import OrderService
 from app.use_cases.products import ProductCapabilityEvidence, ProductService
@@ -37,9 +43,19 @@ class CommerceRuntime:
     platform_configured: bool
     master_key_configured: bool
     product_capabilities: ProductCapabilityEvidence
+    translation_provider: TranslationProvider | None
+    translation_configured: bool
+
+
+def _build_translation_provider() -> TranslationProvider | None:
+    try:
+        return AzureTranslator(AzureTranslatorConfig.from_env())
+    except TranslationConfigurationBlocked:
+        return None
 
 
 def build_commerce_runtime() -> CommerceRuntime:
+    translation_provider = _build_translation_provider()
     key_ring: KeyRing | None = None
     try:
         key_ring = KeyRing.from_current(load_master_key_from_env())
@@ -63,6 +79,8 @@ def build_commerce_runtime() -> CommerceRuntime:
             platform_configured=False,
             master_key_configured=key_ring is not None,
             product_capabilities=capabilities,
+            translation_provider=translation_provider,
+            translation_configured=translation_provider is not None,
         )
 
     product_gateway = TikTokProductGateway(client)
@@ -75,4 +93,6 @@ def build_commerce_runtime() -> CommerceRuntime:
         platform_configured=True,
         master_key_configured=key_ring is not None,
         product_capabilities=capabilities,
+        translation_provider=translation_provider,
+        translation_configured=translation_provider is not None,
     )
