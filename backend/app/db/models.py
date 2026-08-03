@@ -303,6 +303,54 @@ class QuotaSnapshotModel(Base):
     )
 
 
+class OrderRecord(Base, TimestampMixin):
+    __tablename__ = "order_records"
+    __table_args__ = (
+        UniqueConstraint("shop_binding_id", "platform_order_id", name="uq_order_shop_platform"),
+        Index("ix_order_shop_updated", "shop_binding_id", "source_updated_at"),
+        CheckConstraint("item_count >= 0", name="order_nonnegative_item_count"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    shop_binding_id: Mapped[str] = mapped_column(
+        ForeignKey("shop_binding.id", ondelete="CASCADE"), nullable=False
+    )
+    platform_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    order_status: Mapped[str] = mapped_column(String(64), nullable=False)
+    fulfillment_type: Mapped[str | None] = mapped_column(String(64))
+    shipping_type: Mapped[str | None] = mapped_column(String(64))
+    currency: Mapped[str | None] = mapped_column(String(8))
+    total_amount: Mapped[str | None] = mapped_column(String(64))
+    item_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    detail_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    normalized_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class OrderLineRecord(Base, TimestampMixin):
+    __tablename__ = "order_line_records"
+    __table_args__ = (
+        UniqueConstraint("order_record_id", "platform_line_id", name="uq_order_line_platform"),
+        Index("ix_order_line_seller_sku", "seller_sku"),
+        CheckConstraint("quantity > 0", name="order_line_positive_quantity"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    order_record_id: Mapped[str] = mapped_column(
+        ForeignKey("order_records.id", ondelete="CASCADE"), nullable=False
+    )
+    platform_line_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    product_id: Mapped[str | None] = mapped_column(String(128))
+    sku_id: Mapped[str | None] = mapped_column(String(128))
+    seller_sku: Mapped[str | None] = mapped_column(String(128))
+    line_status: Mapped[str | None] = mapped_column(String(64))
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str | None] = mapped_column(String(8))
+    sale_price: Mapped[str | None] = mapped_column(String(64))
+
+
 class OrderSyncCheckpoint(Base, TimestampMixin):
     __tablename__ = "order_sync_checkpoints"
     __table_args__ = (
