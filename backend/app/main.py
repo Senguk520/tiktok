@@ -22,6 +22,7 @@ from app.api.routes.audits import router as audits_router
 from app.api.routes.orders import router as orders_router
 from app.api.routes.products import router as products_router
 from app.api.routes.schedules import router as schedules_router
+from app.api.routes.shops import router as shops_router
 from app.api.routes.tools import router as tools_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.runtime import build_commerce_runtime
@@ -101,6 +102,7 @@ def create_app() -> FastAPI:
     install_security_middleware(application, allow_browser=True, loopback_only=True)
     install_api_errors(application)
     application.include_router(session_router)
+    application.include_router(shops_router)
     application.include_router(products_router)
     application.include_router(orders_router)
     application.include_router(tools_router)

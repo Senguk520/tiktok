@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -11,7 +12,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.api.dependencies import commerce_runtime, shop_access_context
-from app.db.models import AdminSession, ProductDraft
+from app.db.models import (
+    AdminSession,
+    ProductDraft,
+    QuotaSnapshotModel,
+    ScopeSnapshot,
+    ShopBinding,
+)
 from app.domain.enums import AuthorizationStatus, ListingMode, ProductDraftStatus, Scope
 from app.domain.orders import NormalizedOrder, NormalizedOrderLine, NormalizedOrderPage
 from app.domain.product_payload import normalized_product_to_payload
@@ -108,6 +115,94 @@ def test_business_routes_require_session_and_report_blocked_capabilities(
     }
     assert response.headers["cache-control"].startswith("no-store")
     assert response.headers["x-request-id"]
+
+
+def test_shop_registry_exposes_only_safe_capability_facts_and_blocks_inactive_selection(
+    api_client: tuple[TestClient, object],
+) -> None:
+    client, test_app = api_client
+    denied = client.get("/api/shops")
+    assert denied.status_code == 401
+    _csrf, _cookie = _login(client)
+    now = datetime.now(UTC)
+
+    async def seed() -> None:
+        async with test_app.state.db_session_factory.begin() as session:
+            session.add_all(
+                (
+                    ShopBinding(
+                        id=_SHOP_ID,
+                        open_id="private-owner-active",
+                        shop_id="platform-shop-active",
+                        shop_code="MY-ACTIVE",
+                        region="MY",
+                        shop_status="ACTIVE",
+                        kyc_status="VERIFIED",
+                        listing_mode=ListingMode.LOCAL_REPLICATION.value,
+                        authorization_status=AuthorizationStatus.ACTIVE.value,
+                    ),
+                    ShopBinding(
+                        id="33333333-3333-4333-8333-333333333333",
+                        open_id="private-owner-disabled",
+                        shop_id="platform-shop-disabled",
+                        shop_code="MY-DISABLED",
+                        region="MY",
+                        shop_status="INACTIVE",
+                        kyc_status="VERIFIED",
+                        listing_mode=ListingMode.UNKNOWN.value,
+                        authorization_status=AuthorizationStatus.DEAUTHORIZED.value,
+                    ),
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    ScopeSnapshot(
+                        shop_binding_id=_SHOP_ID,
+                        granted_scopes=[
+                            Scope.PRODUCT_BASIC.value,
+                            Scope.ORDER_INFO.value,
+                        ],
+                        missing_scopes=[Scope.PRODUCT_WRITE.value],
+                        captured_at=now,
+                        access_expires_at=now + timedelta(hours=1),
+                    ),
+                    QuotaSnapshotModel(
+                        shop_binding_id=_SHOP_ID,
+                        region="MY",
+                        stage="BEGINNER",
+                        listing_limit=1000,
+                        locally_submitted_count=1,
+                        confirmed_at=now,
+                        expires_at=now + timedelta(hours=1),
+                    ),
+                )
+            )
+
+    asyncio.run(seed())
+    response = client.get("/api/shops")
+    assert response.status_code == 200
+    body = response.json()
+    active, inactive = body["items"]
+    assert active["id"] == _SHOP_ID
+    assert active["selectable"] is True
+    assert active["product_read_enabled"] is True
+    assert active["order_read_enabled"] is True
+    assert active["product_write_preconditions_met"] is False
+    assert active["product_write_blockers"] == ["BLOCKED_PRODUCT_WRITE_SCOPE"]
+    assert inactive["selectable"] is False
+    assert "BLOCKED_SHOP_AUTHORIZATION" in inactive["product_read_blockers"]
+    serialized = response.text.lower()
+    for forbidden in (
+        "private-owner-active",
+        "private-owner-disabled",
+        "open_id",
+        "access_token",
+        "refresh_token",
+        "shop_cipher",
+        "ciphertext",
+    ):
+        assert forbidden not in serialized
 
 
 def test_session_cookie_is_httponly_and_only_digests_are_persisted(
