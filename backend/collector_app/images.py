@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import os
 import stat
 import zlib
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from uuid import uuid4
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from collector_app.outbound import OutboundPolicy, OutboundRequestError, SafeHttpClient
 from collector_app.sources.contracts import SourceAdapterError
@@ -49,6 +52,27 @@ class StoredImage:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageTransformPolicy:
+    """Explicit, deterministic image edits; the default preserves source bytes."""
+
+    center_square_crop: bool = False
+    watermark_text: str | None = None
+    jpeg_quality: int = 90
+
+    def __post_init__(self) -> None:
+        watermark = (self.watermark_text or "").strip()
+        if len(watermark) > 120 or any(ord(character) < 32 for character in watermark):
+            raise ValueError("watermark text is invalid")
+        if not 75 <= self.jpeg_quality <= 95:
+            raise ValueError("JPEG quality must be between 75 and 95")
+        object.__setattr__(self, "watermark_text", watermark or None)
+
+    @property
+    def enabled(self) -> bool:
+        return self.center_square_crop or self.watermark_text is not None
+
+
+@dataclass(frozen=True, slots=True)
 class ImageSourcePolicy:
     source: str
     allowed_hosts: frozenset[str]
@@ -64,11 +88,17 @@ class ImageSourcePolicy:
 class ImageDownloader:
     """Select a source-owned client; callers cannot supply arbitrary hosts."""
 
-    def __init__(self, clients: Mapping[str, SafeHttpClient]) -> None:
+    def __init__(
+        self,
+        clients: Mapping[str, SafeHttpClient],
+        *,
+        transform: ImageTransformPolicy | None = None,
+    ) -> None:
         normalized = {source.strip().upper(): client for source, client in clients.items()}
         if not normalized or any(not source for source in normalized):
             raise ValueError("at least one image source client is required")
         self._clients = MappingProxyType(normalized)
+        self._transform = transform or ImageTransformPolicy()
 
     async def download(self, *, source: str, url: str) -> StoredImage:
         client = self._clients.get(source.strip().upper())
@@ -92,17 +122,23 @@ class ImageDownloader:
             raise SourceAdapterError("image_request_rejected", "image source rejected the request")
 
         declared_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        content_type, width, height = inspect_image(response.content)
-        if declared_type != content_type:
+        source_type, _source_width, _source_height = inspect_image(response.content)
+        if declared_type != source_type:
             raise SourceAdapterError(
                 "image_type_mismatch",
                 "image content does not match its declared type",
             )
-        digest = hashlib.sha256(response.content).hexdigest()
+        stored_content = transform_image(
+            response.content,
+            content_type=source_type,
+            policy=self._transform,
+        )
+        content_type, width, height = inspect_image(stored_content)
+        digest = hashlib.sha256(stored_content).hexdigest()
         try:
             relative_path = await asyncio.to_thread(
                 _atomic_store,
-                response.content,
+                stored_content,
                 _IMAGE_EXTENSION[content_type],
             )
         except (InvalidImageError, UnsafePathError) as exc:
@@ -114,7 +150,7 @@ class ImageDownloader:
             relative_path=relative_path,
             sha256=digest,
             content_type=content_type,
-            byte_size=len(response.content),
+            byte_size=len(stored_content),
             width=width,
             height=height,
         )
@@ -129,7 +165,10 @@ class ImageDownloader:
             ) from exc
 
 
-def default_image_downloader() -> ImageDownloader:
+def default_image_downloader(
+    *,
+    transform: ImageTransformPolicy | None = None,
+) -> ImageDownloader:
     """Build evidence-backed, exact CDN host policies for supported sources."""
 
     policies = (
@@ -157,8 +196,98 @@ def default_image_downloader() -> ImageDownloader:
                 )
             )
             for policy in policies
-        }
+        },
+        transform=transform,
     )
+
+
+def transform_image(
+    content: bytes,
+    *,
+    content_type: str,
+    policy: ImageTransformPolicy,
+) -> bytes:
+    """Apply explicitly configured edits and strip untrusted image metadata."""
+
+    if not policy.enabled:
+        return content
+    if content_type == "image/gif":
+        raise SourceAdapterError(
+            "image_transform_unsupported",
+            "animated GIF transformation is not supported",
+        )
+    formats = {
+        "image/jpeg": "JPEG",
+        "image/png": "PNG",
+        "image/webp": "WEBP",
+    }
+    output_format = formats.get(content_type)
+    if output_format is None:
+        raise SourceAdapterError("image_transform_unsupported", "image format cannot be transformed")
+    try:
+        with Image.open(io.BytesIO(content)) as opened:
+            if getattr(opened, "n_frames", 1) != 1:
+                raise SourceAdapterError(
+                    "image_transform_unsupported",
+                    "animated image transformation is not supported",
+                )
+            opened.load()
+            image = ImageOps.exif_transpose(opened)
+            if image.width * image.height > _MAX_PIXELS:
+                raise SourceAdapterError(
+                    "image_dimensions_invalid",
+                    "image dimensions exceed safe limits",
+                )
+            if policy.center_square_crop:
+                side = min(image.width, image.height)
+                left = (image.width - side) // 2
+                top = (image.height - side) // 2
+                image = image.crop((left, top, left + side, top + side))
+            if policy.watermark_text:
+                image = _watermark(image, policy.watermark_text)
+            if output_format == "JPEG":
+                image = image.convert("RGB")
+            elif image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA")
+            target = io.BytesIO()
+            save_options: dict[str, int | bool] = {"optimize": True}
+            if output_format in {"JPEG", "WEBP"}:
+                save_options["quality"] = policy.jpeg_quality
+            image.save(target, format=output_format, **save_options)
+    except SourceAdapterError:
+        raise
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+        raise SourceAdapterError(
+            "image_transform_failed",
+            "image could not be safely transformed",
+        ) from exc
+    transformed = target.getvalue()
+    if len(transformed) > _MAX_IMAGE_BYTES:
+        raise SourceAdapterError("image_size_invalid", "transformed image exceeds the size limit")
+    transformed_type, _width, _height = inspect_image(transformed)
+    if transformed_type != content_type:
+        raise SourceAdapterError("image_type_mismatch", "transformed image type changed unexpectedly")
+    return transformed
+
+
+def _watermark(image: Image.Image, text: str) -> Image.Image:
+    canvas = image.convert("RGBA")
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default()
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    text_width = right - left
+    text_height = bottom - top
+    margin = max(4, min(canvas.size) // 100)
+    x = max(margin, canvas.width - text_width - margin * 2)
+    y = max(margin, canvas.height - text_height - margin * 2)
+    draw.rounded_rectangle(
+        (x - margin, y - margin, x + text_width + margin, y + text_height + margin),
+        radius=max(2, margin // 2),
+        fill=(0, 0, 0, 150),
+    )
+    draw.text((x, y), text, fill=(255, 255, 255, 220), font=font)
+    return Image.alpha_composite(canvas, overlay)
 
 
 def inspect_image(content: bytes) -> tuple[str, int, int]:

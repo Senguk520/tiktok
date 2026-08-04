@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -23,7 +25,7 @@ from collector_app.db.models import (
     SourceRateLimit,
 )
 from collector_app.db.repository import CollectorLeaseLost, claim_due_jobs, persist_failure, start_attempt
-from collector_app.images import ImageDownloader, StoredImage, inspect_image
+from collector_app.images import ImageDownloader, ImageTransformPolicy, StoredImage, inspect_image
 from collector_app.normalizers import normalize_artifact
 from collector_app.outbound import OutboundPolicy, SafeHttpClient
 from collector_app.sources import (
@@ -543,6 +545,33 @@ async def test_image_downloader_validates_container_and_stores_atomically() -> N
 
 
 @pytest.mark.asyncio
+async def test_image_downloader_applies_explicit_crop_and_watermark_policy() -> None:
+    source = _png(width=8, height=4)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": "image/png"}, content=source)
+
+    client = SafeHttpClient(
+        OutboundPolicy(allowed_hosts=frozenset({"cf.cjdropshipping.com"})),
+        resolver=_public_resolver,
+        transport=httpx.MockTransport(handler),
+    )
+    downloader = ImageDownloader(
+        {"CJ": client},
+        transform=ImageTransformPolicy(center_square_crop=True, watermark_text="shop"),
+    )
+    image = await downloader.download(source="CJ", url="https://cf.cjdropshipping.com/product.png")
+    try:
+        stored = resolve_collector_image_path(PROJECT_ROOT / image.relative_path).read_bytes()
+        assert stored != source
+        assert inspect_image(stored) == ("image/png", 4, 4)
+        assert image.width == 4 and image.height == 4
+        assert image.sha256 == hashlib.sha256(stored).hexdigest()
+    finally:
+        assert await downloader.discard(image)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("declared", "content", "code"),
     [
@@ -582,6 +611,53 @@ def test_image_inspection_limits_dimensions_size_and_collector_paths() -> None:
     assert size.value.code == "image_size_invalid"
     with pytest.raises(InvalidImageError):
         resolve_collector_image_path(COLLECTOR_IMAGE_DIR / ".." / f"{uuid4()}.png")
+
+
+def test_1688_open_normalizer_maps_documented_product_shape() -> None:
+    document = {
+        "productInfo": {
+            "productID": 123456789,
+            "subject": "Official 1688 Product",
+            "description": "<b>Useful</b> product",
+            "categoryID": 1048182,
+            "image": {
+                "images": [
+                    "img/ibank/2024/123/product-main.jpg",
+                    "https://cbu02.alicdn.com/img/ibank/2024/123/product-detail.png",
+                ]
+            },
+            "skuInfos": [
+                {
+                    "skuId": 4469920756190,
+                    "price": "18.20",
+                    "attributes": [{"attributeID": 321, "attValueID": 654}],
+                }
+            ],
+            "saleInfo": {"priceRanges": [{"startQuantity": 1, "price": "18.20"}]},
+        }
+    }
+    normalized = normalize_artifact(
+        SourceArtifact(
+            source="1688",
+            mode=SourceMode.OFFICIAL_API,
+            canonical_url="https://detail.1688.com/offer/123456789.html",
+            source_product_id="123456789",
+            media_type="application/json",
+            body=json.dumps(document).encode(),
+        )
+    )
+
+    assert normalized.source_product_id == "123456789"
+    assert normalized.product.title == "Official 1688 Product"
+    assert normalized.product.description == "Useful product"
+    assert normalized.product.category_id == "1048182"
+    assert normalized.product.skus[0].price == Decimal("18.20")
+    assert normalized.product.skus[0].attributes == {"321": "654"}
+    assert normalized.product.images[0].source_url == (
+        "https://cbu01.alicdn.com/img/ibank/2024/123/product-main.jpg"
+    )
+    assert normalized.product.images[1].role == "DETAIL"
+    assert normalized.product.source_trace["skus"] == "1688.productInfo.skuInfos"
 
 
 def test_normalizers_reject_malicious_or_unsupported_source_documents() -> None:

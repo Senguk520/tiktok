@@ -183,6 +183,16 @@ def test_contract_rejects_unknown_fields_and_versions() -> None:
     with pytest.raises(CollectorContractError, match="digest"):
         CollectorImportEnvelopeV1.from_mapping(tampered)
 
+    official_1688 = CollectorImportEnvelopeV1(
+        result_id="collector-result-1688",
+        job_id="collector-job-1688",
+        source="1688",
+        source_mode="OFFICIAL_API",
+        source_product_id="123456789",
+        product=_product(),
+    )
+    assert CollectorImportEnvelopeV1.from_mapping(official_1688.to_mapping()) == official_1688
+
     wrong_mode = dict(raw)
     wrong_mode["source_mode"] = "PUBLIC_PAGE"
     with pytest.raises(CollectorContractError, match="source identity"):

@@ -19,6 +19,10 @@ from collector_app.sources import (
     build_source_registry,
     default_source_registry,
 )
+from collector_app.sources.alibaba_1688_open import (
+    Alibaba1688OpenPlatformConfig,
+    sign_open_platform_request,
+)
 from collector_app.sources.contracts import SourceArtifact
 
 
@@ -209,17 +213,23 @@ def test_registry_is_exact_and_rejects_ambiguous_source_modes() -> None:
 def test_default_registry_exposes_only_evidence_backed_modes() -> None:
     registry = default_source_registry(cj_access_token=None)
     assert [(item.source, item.mode.value) for item in registry.available] == [
+        ("1688", "OFFICIAL_API"),
         ("1688", "PUBLIC_PAGE"),
         ("CJ", "OFFICIAL_API"),
     ]
-    with pytest.raises(SourceAdapterError, match="not registered"):
-        registry.resolve(
-            SourceRequest(
-                "1688",
-                SourceMode.OFFICIAL_API,
-                "https://detail.1688.com/offer/12345.html",
-            )
-        )
+
+
+@pytest.mark.asyncio
+async def test_1688_official_mode_fails_closed_without_own_grant() -> None:
+    registry = default_source_registry(cj_access_token=None)
+    request = SourceRequest(
+        "1688",
+        SourceMode.OFFICIAL_API,
+        "https://detail.1688.com/offer/12345.html",
+    )
+    with pytest.raises(SourceAdapterError) as captured:
+        await registry.resolve(request).collect(request)
+    assert captured.value.code == "source_credentials_missing"
 
 
 @pytest.mark.asyncio
@@ -281,6 +291,136 @@ async def test_cj_adapter_fails_closed_without_credentials_or_matching_identity(
     with pytest.raises(SourceAdapterError) as identity:
         await configured.resolve(mismatched).collect(mismatched)
     assert identity.value.code == "source_identity_mismatch"
+
+
+def test_1688_open_platform_signature_vector() -> None:
+    signature = sign_open_platform_request(
+        api_path="param2/1/com.alibaba.product/alibaba.product.get/app-key",
+        parameters={
+            "access_token": "access-token",
+            "productID": "123456789",
+            "webSite": "1688",
+        },
+        app_secret="app-secret",
+    )
+    assert signature == "93A389629D6D0D08CC3A537195DFF8E36E1D8DFC"
+
+
+@pytest.mark.parametrize("app_key", ["../escape", "key/segment", "key?query", " key with spaces "])
+def test_1688_open_platform_config_rejects_untrusted_app_keys(app_key: str) -> None:
+    with pytest.raises(ValueError, match="app_key"):
+        Alibaba1688OpenPlatformConfig(
+            app_key=app_key,
+            app_secret="app-secret",
+            access_token="access-token",
+        )
+
+
+@pytest.mark.asyncio
+async def test_1688_open_platform_uses_signed_first_party_gateway() -> None:
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"productInfo": {"productID": 123456789}},
+        )
+
+    http = SafeHttpClient(
+        OutboundPolicy(allowed_hosts=frozenset({"gw.open.1688.com"})),
+        resolver=_public_resolver,
+        transport=httpx.MockTransport(handler),
+    )
+    registry = default_source_registry(
+        cj_access_token=None,
+        alibaba_1688_config=Alibaba1688OpenPlatformConfig(
+            app_key="app-key",
+            app_secret="app-secret",
+            access_token="access-token",
+        ),
+        alibaba_1688_open_http=http,
+    )
+    request = SourceRequest(
+        "1688",
+        SourceMode.OFFICIAL_API,
+        "https://detail.1688.com/offer/123456789.html",
+    )
+    artifact = await registry.resolve(request).collect(request)
+
+    assert artifact.source_product_id == "123456789"
+    assert artifact.canonical_url == "https://detail.1688.com/offer/123456789.html"
+    assert len(seen) == 1
+    assert seen[0].url.path == "/openapi/param2/1/com.alibaba.product/alibaba.product.get/app-key"
+    assert seen[0].url.params["access_token"] == "access-token"
+    assert seen[0].url.params["_aop_signature"] == "93A389629D6D0D08CC3A537195DFF8E36E1D8DFC"
+    assert "app-secret" not in str(seen[0].url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("document", "code"),
+    [
+        ({"productInfo": {"productID": 987654321}}, "source_identity_mismatch"),
+        (
+            {"error_code": "InvalidAccessToken", "error_message": "access-token"},
+            "source_business_error",
+        ),
+    ],
+)
+async def test_1688_open_platform_fails_closed_without_leaking_credentials(
+    document: dict[str, object],
+    code: str,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, json=document)
+
+    http = SafeHttpClient(
+        OutboundPolicy(allowed_hosts=frozenset({"gw.open.1688.com"})),
+        resolver=_public_resolver,
+        transport=httpx.MockTransport(handler),
+    )
+    registry = default_source_registry(
+        cj_access_token=None,
+        alibaba_1688_config=Alibaba1688OpenPlatformConfig(
+            app_key="app-key",
+            app_secret="app-secret",
+            access_token="access-token",
+        ),
+        alibaba_1688_open_http=http,
+    )
+    request = SourceRequest(
+        "1688",
+        SourceMode.OFFICIAL_API,
+        "https://detail.1688.com/offer/123456789.html",
+    )
+    with pytest.raises(SourceAdapterError) as captured:
+        await registry.resolve(request).collect(request)
+    assert captured.value.code == code
+    assert "access-token" not in str(captured.value)
+    assert "app-secret" not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_1688_open_platform_rejects_non_offer_url_even_with_product_id() -> None:
+    registry = default_source_registry(
+        cj_access_token=None,
+        alibaba_1688_config=Alibaba1688OpenPlatformConfig(
+            app_key="app-key",
+            app_secret="app-secret",
+            access_token="access-token",
+        ),
+    )
+    request = SourceRequest(
+        "1688",
+        SourceMode.OFFICIAL_API,
+        "https://detail.1688.com/not-an-offer",
+        {"product_id": "123456789"},
+    )
+    with pytest.raises(SourceAdapterError) as captured:
+        await registry.resolve(request).collect(request)
+    assert captured.value.code == "invalid_source_url"
 
 
 @pytest.mark.asyncio

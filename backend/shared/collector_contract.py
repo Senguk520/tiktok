@@ -20,7 +20,7 @@ from typing import Any, Final
 CONTRACT_NAME: Final[str] = "collector.product-import"
 CONTRACT_VERSION: Final[int] = 1
 _ALLOWED_SOURCE_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
-    {("CJ", "OFFICIAL_API"), ("1688", "PUBLIC_PAGE")}
+    {("CJ", "OFFICIAL_API"), ("1688", "OFFICIAL_API"), ("1688", "PUBLIC_PAGE")}
 )
 _ALLOWED_IMAGE_ROLES: Final[frozenset[str]] = frozenset({"MAIN", "DETAIL"})
 _ALLOWED_IMAGE_TYPES: Final[frozenset[str]] = frozenset(

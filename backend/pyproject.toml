@@ -11,6 +11,7 @@ dependencies = [
     "cryptography",
     "fastapi",
     "httpx",
+    "pillow",
     "pydantic-settings",
     "sqlalchemy",
     "aiosqlite",

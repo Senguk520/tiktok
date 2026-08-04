@@ -116,6 +116,8 @@ def normalize_artifact(artifact: SourceArtifact) -> NormalizedCollection:
         raise SourceAdapterError("source_response_too_large", "source artifact exceeds its size limit")
     if artifact.source == "CJ" and artifact.mode is SourceMode.OFFICIAL_API:
         return _normalize_cj(artifact)
+    if artifact.source == "1688" and artifact.mode is SourceMode.OFFICIAL_API:
+        return _normalize_1688_open(artifact)
     if artifact.source == "1688" and artifact.mode is SourceMode.PUBLIC_PAGE:
         return _normalize_1688(artifact)
     raise SourceAdapterError("normalizer_missing", "source artifact has no registered normalizer")
@@ -186,6 +188,139 @@ def _normalize_cj(artifact: SourceArtifact) -> NormalizedCollection:
         ),
     )
     return NormalizedCollection(product=product, source_product_id=source_product_id)
+
+
+def _normalize_1688_open(artifact: SourceArtifact) -> NormalizedCollection:
+    if artifact.media_type != "application/json":
+        raise SourceAdapterError("invalid_source_response", "1688 Open Platform artifact must be JSON")
+    try:
+        document = json.loads(artifact.body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceAdapterError(
+            "invalid_source_response",
+            "1688 Open Platform artifact contains invalid JSON",
+        ) from exc
+    root = _mapping(document, code="invalid_source_response", field="1688 response")
+    product_info = _mapping(
+        root.get("productInfo"),
+        code="invalid_source_response",
+        field="1688 productInfo",
+    )
+    source_product_id = _bounded_identifier(
+        product_info.get("productID") or product_info.get("productId") or artifact.source_product_id,
+        field="1688 product ID",
+    )
+    if artifact.source_product_id and source_product_id != artifact.source_product_id:
+        raise SourceAdapterError("source_identity_mismatch", "1688 artifact identity changed")
+    title = _required_text(product_info.get("subject"), field="1688 title", maximum=_MAX_TITLE)
+    description = _plain_text(product_info.get("description", ""), maximum=_MAX_DESCRIPTION)
+    category_value = product_info.get("categoryID") or product_info.get("categoryId")
+    category_id = (
+        _bounded_identifier(category_value, field="1688 category ID")
+        if category_value is not None
+        else None
+    )
+    image_container = product_info.get("image")
+    if isinstance(image_container, Mapping):
+        raw_images = (
+            image_container.get("images")
+            or image_container.get("imageURLs")
+            or image_container.get("mainImages")
+        )
+    else:
+        raw_images = product_info.get("images") or product_info.get("imageURLs")
+    image_urls = _1688_open_image_urls(_sequence_or_empty(raw_images))
+    if not image_urls:
+        raise SourceAdapterError("invalid_source_product", "1688 product has no safe image URL")
+
+    base_price = _first_1688_price(product_info.get("saleInfo"))
+    raw_skus = _sequence_or_empty(product_info.get("skuInfos"))
+    if len(raw_skus) > _MAX_VARIANTS:
+        raise SourceAdapterError("invalid_source_product", "1688 SKU count is invalid")
+    skus: list[SourceSku] = []
+    for index, raw_sku in enumerate(raw_skus):
+        sku = _mapping(raw_sku, code="invalid_source_product", field="1688 SKU")
+        seller_sku = _bounded_identifier(
+            sku.get("skuId") or sku.get("specId") or sku.get("skuCode"),
+            field=f"1688 SKU {index + 1} ID",
+        )
+        price_value = sku.get("price") or sku.get("consignPrice") or base_price
+        skus.append(
+            SourceSku(
+                seller_sku=seller_sku,
+                price=_price(price_value, field=f"1688 SKU {index + 1} price"),
+                currency="CNY",
+                attributes=_1688_sku_attributes(sku.get("attributes")),
+            )
+        )
+    if not skus:
+        skus.append(
+            SourceSku(
+                seller_sku=f"1688-{source_product_id}",
+                price=_price(base_price, field="1688 product price"),
+                currency="CNY",
+                attributes={},
+            )
+        )
+    _require_unique_skus(skus)
+    product = SourceProduct(
+        title=title,
+        description=description,
+        category_id=category_id,
+        skus=tuple(skus),
+        images=tuple(
+            SourceImage(source_url=url, role="MAIN" if index == 0 else "DETAIL")
+            for index, url in enumerate(image_urls)
+        ),
+        attributes={},
+        source_trace={
+            "title": "1688.productInfo.subject",
+            "description": "1688.productInfo.description",
+            "category_id": "1688.productInfo.categoryID",
+            "skus": "1688.productInfo.skuInfos",
+            "images": "1688.productInfo.image.images",
+        },
+        unmapped_warnings=(
+            "open_platform_facts_require_human_confirmation",
+            "tiktok_category_requires_manual_mapping",
+            "warehouse_inventory_requires_manual_mapping",
+        ),
+    )
+    return NormalizedCollection(product=product, source_product_id=source_product_id)
+
+
+def _first_1688_price(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return None
+    direct = value.get("price") or value.get("consignPrice")
+    if direct is not None:
+        return direct
+    ranges = _sequence_or_empty(value.get("priceRanges"))
+    for item in ranges:
+        if isinstance(item, Mapping) and (price := item.get("price")) is not None:
+            return price
+    return None
+
+
+def _1688_sku_attributes(value: object) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in _sequence_or_empty(value)[:30]:
+        if not isinstance(item, Mapping):
+            raise SourceAdapterError("invalid_source_product", "1688 SKU attribute is invalid")
+        key_value = item.get("attributeID") or item.get("attributeId") or item.get("attributeDisplayName")
+        item_value = (
+            item.get("attributeValueID")
+            or item.get("attributeValueId")
+            or item.get("attValueID")
+            or item.get("attributeValue")
+            or item.get("customValueName")
+        )
+        key = _bounded_identifier(key_value, field="1688 SKU attribute key")
+        rendered = _bounded_identifier(item_value, field="1688 SKU attribute value")
+        if key in result and result[key] != rendered:
+            raise SourceAdapterError("invalid_source_product", "1688 SKU attributes are duplicated")
+        result[key] = rendered
+    return result
 
 
 def _normalize_1688(artifact: SourceArtifact) -> NormalizedCollection:
@@ -378,6 +513,18 @@ def _price(value: object, *, field: str) -> Decimal:
     if not amount.is_finite() or amount <= 0 or amount > Decimal("100000000"):
         raise SourceAdapterError("invalid_source_product", f"{field} is out of range")
     return amount
+
+
+def _1688_open_image_urls(values: Sequence[object]) -> tuple[str, ...]:
+    candidates: list[object] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if candidate.startswith("img/") and len(candidate) <= 2000:
+            candidate = f"https://cbu01.alicdn.com/{candidate}"
+        candidates.append(candidate)
+    return _image_urls(candidates)
 
 
 def _image_urls(values: Sequence[object]) -> tuple[str, ...]:
