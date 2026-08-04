@@ -26,8 +26,9 @@ const navigation = [
 
 const activePath = computed(() => route.path)
 
-const optionLabel = (item: ShopSummary): string =>
-  `${item.shop_code || item.shop_id} · ${item.region} · ${item.listing_mode}`
+const optionLabel = (
+  item: Readonly<Pick<ShopSummary, 'shop_code' | 'shop_id' | 'region' | 'listing_mode'>>,
+): string => `${item.shop_code || item.shop_id} · ${item.region} · ${item.listing_mode}`
 
 const applyShop = (): void => {
   if (!shopInput.value) {
