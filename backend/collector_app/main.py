@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict
 
@@ -21,6 +22,7 @@ from collector_app.db.base import (
 )
 from migrations.collector import migrate_engine
 from shared.http_security import install_security_middleware
+from shared.safe_paths import PROJECT_ROOT
 
 
 class ServiceStatus(BaseModel):
@@ -33,6 +35,7 @@ class ServiceStatus(BaseModel):
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
     settings: CollectorDatabaseSettings = database_settings()
     engine, session_factory = create_engine_and_session_factory(settings)
     await migrate_engine(engine)
