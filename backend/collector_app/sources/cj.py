@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import urlencode
 
 from collector_app.outbound import (
     OutboundPolicy,
@@ -18,17 +18,10 @@ from collector_app.sources.contracts import (
     SourceMode,
     SourceRequest,
 )
+from collector_app.sources.intents import SourceIntentError, normalize_source_identity
 
 CJ_SOURCE = "CJ"
 CJ_PRODUCT_ENDPOINT = "https://developers.cjdropshipping.com/api2.0/v1/product/query"
-_CJ_INPUT_HOSTS = frozenset(
-    {
-        "cjdropshipping.com",
-        "www.cjdropshipping.com",
-        "app.cjdropshipping.com",
-        "developers.cjdropshipping.com",
-    }
-)
 _PRODUCT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
@@ -112,28 +105,20 @@ def _extract_product_id(request: SourceRequest) -> str:
     allowed_payload = {"product_id"}
     if set(request.payload) - allowed_payload:
         raise SourceAdapterError("invalid_source_request", "CJ request contains unsupported fields")
+    try:
+        identity = normalize_source_identity(
+            source=request.source,
+            mode=request.mode,
+            source_url=request.source_url,
+        )
+    except SourceIntentError as exc:
+        raise SourceAdapterError(exc.code, str(exc)) from exc
     explicit = request.payload.get("product_id")
-    parsed = urlsplit(request.source_url)
-    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
-        raise SourceAdapterError("invalid_source_url", "CJ source URL must use HTTPS without credentials")
-    host = (parsed.hostname or "").rstrip(".").lower()
-    if host not in _CJ_INPUT_HOSTS:
-        raise SourceAdapterError("invalid_source_url", "CJ source URL is not recognized")
-    query = parse_qs(parsed.query, keep_blank_values=False)
-    from_url = next(
-        (
-            values[0]
-            for key in ("pid", "productId", "product_id")
-            if (values := query.get(key))
-        ),
-        None,
-    )
-    product_id = str(explicit or from_url or "").strip()
-    if not _PRODUCT_ID.fullmatch(product_id):
+    if explicit is not None and not _PRODUCT_ID.fullmatch(str(explicit).strip()):
         raise SourceAdapterError("invalid_product_id", "CJ product ID is missing or invalid")
-    if explicit is not None and from_url is not None and str(explicit).strip() != from_url:
+    if explicit is not None and str(explicit).strip() != identity.source_product_id:
         raise SourceAdapterError("source_identity_mismatch", "CJ URL and payload identify different products")
-    return product_id
+    return identity.source_product_id
 
 
 def _raise_for_http_status(response: SafeHttpResponse) -> None:

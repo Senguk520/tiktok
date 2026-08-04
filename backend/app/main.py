@@ -20,6 +20,7 @@ from app.api.auth import AdminAuthSettings
 from app.api.auth import router as session_router
 from app.api.errors import install_api_errors
 from app.api.routes.audits import router as audits_router
+from app.api.routes.collector import router as collector_router
 from app.api.routes.orders import router as orders_router
 from app.api.routes.products import router as products_router
 from app.api.routes.schedules import router as schedules_router
@@ -33,6 +34,7 @@ from app.db.base import (
     database_settings,
     dispose_engine,
 )
+from app.integrations.collector import CollectorClientSettings, CollectorHttpClient
 from app.use_cases.scheduler import (
     CoreScheduleDispatcher,
     ScheduleWorker,
@@ -41,6 +43,7 @@ from app.use_cases.scheduler import (
 from migrations.core import migrate_engine
 from shared.http_security import install_security_middleware
 from shared.safe_paths import PROJECT_ROOT
+from shared.security import SecurityConfigurationError
 
 
 class ServiceStatus(BaseModel):
@@ -61,6 +64,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.db_engine = engine
     application.state.db_session_factory = session_factory
     application.state.admin_auth_settings = AdminAuthSettings.from_env()
+    try:
+        collector_http_client = CollectorHttpClient(CollectorClientSettings.from_env())
+    except SecurityConfigurationError:
+        collector_http_client = None
+    application.state.collector_http_client = collector_http_client
     runtime = build_commerce_runtime()
     application.state.commerce_runtime = runtime
     scheduler_dispatcher = CoreScheduleDispatcher(
@@ -89,6 +97,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.db_engine = None
         application.state.db_session_factory = None
         application.state.admin_auth_settings = None
+        application.state.collector_http_client = None
         application.state.commerce_runtime = None
         application.state.scheduler_worker = None
 
@@ -105,6 +114,7 @@ def create_app() -> FastAPI:
     install_security_middleware(application, allow_browser=True, loopback_only=True)
     install_api_errors(application)
     application.include_router(session_router)
+    application.include_router(collector_router)
     application.include_router(shops_router)
     application.include_router(products_router)
     application.include_router(orders_router)

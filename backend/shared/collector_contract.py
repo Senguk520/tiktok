@@ -351,6 +351,36 @@ class CollectorImportReceiptV1:
         if not isinstance(self.created, bool):
             raise CollectorContractError("receipt creation marker must be boolean")
 
+    def to_mapping(self) -> dict[str, str | bool]:
+        return {
+            "contract": CONTRACT_NAME,
+            "version": CONTRACT_VERSION,
+            "result_id": self.result_id,
+            "draft_id": self.draft_id,
+            "envelope_digest": self.envelope_digest,
+            "created": self.created,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> CollectorImportReceiptV1:
+        fields = {
+            "contract",
+            "version",
+            "result_id",
+            "draft_id",
+            "envelope_digest",
+            "created",
+        }
+        raw = _strict_mapping(value, field="receipt", allowed=fields, required=fields)
+        if raw["contract"] != CONTRACT_NAME or raw["version"] != CONTRACT_VERSION:
+            raise CollectorContractError("unsupported import receipt contract")
+        return cls(
+            result_id=raw["result_id"],
+            draft_id=raw["draft_id"],
+            envelope_digest=raw["envelope_digest"],
+            created=raw["created"],
+        )
+
 
 def _envelope_digest(
     *,

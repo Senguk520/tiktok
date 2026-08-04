@@ -25,6 +25,9 @@ _KEY_VALUE_RE = re.compile(r"^(?P<version>v[1-9][0-9]*):(?P<key>[A-Za-z0-9_-]+={
 _WIRE_VALUE_RE = re.compile(
     r"^(?P<version>v[1-9][0-9]*):(?P<nonce>[A-Za-z0-9_-]+={0,2}):(?P<ciphertext>[A-Za-z0-9_-]+={0,2})$"
 )
+INTERNAL_HMAC_SECRET_ENV = "COLLECTOR_INTERNAL_HMAC_SECRET"
+INTERNAL_HMAC_TIMESTAMP_HEADER = "X-Internal-Timestamp"
+INTERNAL_HMAC_SIGNATURE_HEADER = "X-Internal-Signature"
 
 
 class SecurityConfigurationError(ValueError):
@@ -208,6 +211,30 @@ def decrypt_text(
         return decrypt_value(encrypted, key_ring, aad=aad).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise AuthenticationError("decrypted value is not UTF-8") from exc
+
+
+def load_internal_hmac_secret_from_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    variable: str = INTERNAL_HMAC_SECRET_ENV,
+) -> bytes:
+    """Load a strong process-to-process HMAC secret without exposing its value."""
+
+    values = os.environ if env is None else env
+    value = values.get(variable, "")
+    try:
+        secret = value.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise SecurityConfigurationError("internal HMAC secret is invalid") from exc
+    if (
+        len(secret) < 32
+        or len(secret) > 4096
+        or any(character < 32 or character == 127 for character in secret)
+    ):
+        raise SecurityConfigurationError(
+            f"missing or invalid environment key: {variable}"
+        )
+    return secret
 
 
 def _internal_message(

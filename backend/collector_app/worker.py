@@ -227,3 +227,29 @@ class CollectorWorker:
                 # Cleanup is best effort and must never replace the primary
                 # outcome with path, driver, or operating-system diagnostics.
                 continue
+
+
+async def run_collector_loop(
+    worker: CollectorWorker,
+    stop: asyncio.Event,
+    *,
+    idle_seconds: float = 1.0,
+    error_seconds: float = 5.0,
+) -> None:
+    """Poll durable jobs until shutdown without retaining process-local facts."""
+
+    if idle_seconds <= 0 or error_seconds <= 0:
+        raise ValueError("collector polling delays must be positive")
+    while not stop.is_set():
+        try:
+            outcomes = await worker.run_once()
+            delay = 0.0 if outcomes else idle_seconds
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            delay = error_seconds
+        if delay > 0:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except TimeoutError:
+                pass

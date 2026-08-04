@@ -79,6 +79,19 @@ async def export_result(
     )
 
 
+async def confirm_import_receipt(
+    session: AsyncSession,
+    *,
+    receipt: CollectorImportReceiptV1,
+) -> bool:
+    """Verify a Core receipt against current export facts before marking imported."""
+
+    envelope = await export_result(session, result_id=receipt.result_id)
+    if receipt.result_id != envelope.result_id or receipt.envelope_digest != envelope.digest:
+        raise CollectorContractError("Core import receipt does not match the exported envelope")
+    return await mark_result_imported(session, result_id=receipt.result_id)
+
+
 class CollectorImportCoordinator:
     """Bridge two independent transactions through a replay-safe Core port."""
 
@@ -105,12 +118,7 @@ class CollectorImportCoordinator:
             shop_binding_id=shop_binding_id,
             envelope=envelope,
         )
-        if (
-            receipt.result_id != envelope.result_id
-            or receipt.envelope_digest != envelope.digest
-        ):
-            raise CollectorContractError("Core import receipt does not match the exported envelope")
         async with self._collector_session_factory() as session:
-            await mark_result_imported(session, result_id=result_id)
+            await confirm_import_receipt(session, receipt=receipt)
             await session.commit()
         return receipt

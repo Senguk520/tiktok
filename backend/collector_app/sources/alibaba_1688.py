@@ -8,9 +8,6 @@ an anti-bot or consent page.
 
 from __future__ import annotations
 
-import re
-from urllib.parse import urlsplit
-
 from collector_app.outbound import (
     OutboundPolicy,
     OutboundRequestError,
@@ -23,10 +20,10 @@ from collector_app.sources.contracts import (
     SourceMode,
     SourceRequest,
 )
+from collector_app.sources.intents import SourceIntentError, normalize_source_identity
 
 ALIBABA_1688_SOURCE = "1688"
 _1688_HOSTS = frozenset({"detail.1688.com", "m.1688.com"})
-_OFFER_PATH = re.compile(r"^/offer/(?P<product_id>[1-9][0-9]{4,30})\.html$")
 
 
 class Alibaba1688PublicPageAdapter:
@@ -91,19 +88,14 @@ def _require_request(request: SourceRequest) -> None:
 
 
 def _extract_product_id(raw_url: str) -> str:
-    parsed = urlsplit(raw_url)
-    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
-        raise SourceAdapterError(
-            "invalid_source_url",
-            "1688 source URL must use HTTPS without credentials",
-        )
-    host = (parsed.hostname or "").rstrip(".").lower()
-    if host not in _1688_HOSTS or parsed.port not in (None, 443):
-        raise SourceAdapterError("invalid_source_url", "1688 source URL is not recognized")
-    match = _OFFER_PATH.fullmatch(parsed.path)
-    if match is None:
-        raise SourceAdapterError("invalid_product_id", "1688 offer URL is missing a valid product ID")
-    return match.group("product_id")
+    try:
+        return normalize_source_identity(
+            source=ALIBABA_1688_SOURCE,
+            mode=SourceMode.PUBLIC_PAGE,
+            source_url=raw_url,
+        ).source_product_id
+    except SourceIntentError as exc:
+        raise SourceAdapterError(exc.code, str(exc)) from exc
 
 
 def _raise_for_http_status(response: SafeHttpResponse) -> None:

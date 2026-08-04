@@ -8,10 +8,11 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 from collector_app.outbound import OutboundPolicy, OutboundRequestError, SafeHttpClient, SafeHttpResponse
 from collector_app.sources.contracts import SourceAdapterError, SourceArtifact, SourceMode, SourceRequest
+from collector_app.sources.intents import SourceIntentError, normalize_source_identity
 
 ALIBABA_1688_SOURCE = "1688"
 ALIBABA_1688_OPEN_HOST = "gw.open.1688.com"
@@ -19,7 +20,6 @@ ALIBABA_1688_API_NAMESPACE = "com.alibaba.product"
 ALIBABA_1688_API_NAME = "alibaba.product.get"
 _PRODUCT_ID = re.compile(r"^[1-9][0-9]{4,30}$")
 _APP_KEY = re.compile(r"^[A-Za-z0-9_-]{3,128}$")
-_INPUT_HOSTS = frozenset({"detail.1688.com", "m.1688.com"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,23 +150,20 @@ class Alibaba1688OpenPlatformAdapter:
 def _extract_product_id(request: SourceRequest) -> str:
     if set(request.payload) - {"product_id"}:
         raise SourceAdapterError("invalid_source_request", "1688 request contains unsupported fields")
+    try:
+        identity = normalize_source_identity(
+            source=request.source,
+            mode=request.mode,
+            source_url=request.source_url,
+        )
+    except SourceIntentError as exc:
+        raise SourceAdapterError(exc.code, str(exc)) from exc
     explicit = str(request.payload.get("product_id", "")).strip()
-    parsed = urlsplit(request.source_url)
-    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
-        raise SourceAdapterError("invalid_source_url", "1688 source URL must use HTTPS without credentials")
-    host = (parsed.hostname or "").rstrip(".").lower()
-    if host not in _INPUT_HOSTS or parsed.port not in (None, 443):
-        raise SourceAdapterError("invalid_source_url", "1688 source URL is not recognized")
-    match = re.fullmatch(r"/offer/([1-9][0-9]{4,30})\.html", parsed.path)
-    if match is None:
-        raise SourceAdapterError("invalid_source_url", "1688 source URL must identify one offer")
-    from_url = match.group(1)
-    product_id = explicit or from_url
-    if not _PRODUCT_ID.fullmatch(product_id):
+    if explicit and not _PRODUCT_ID.fullmatch(explicit):
         raise SourceAdapterError("invalid_product_id", "1688 offer URL is missing a valid product ID")
-    if explicit and from_url and explicit != from_url:
+    if explicit and explicit != identity.source_product_id:
         raise SourceAdapterError("source_identity_mismatch", "1688 URL and payload identify different products")
-    return product_id
+    return identity.source_product_id
 
 
 def _json_object(response: SafeHttpResponse) -> Mapping[str, object]:
