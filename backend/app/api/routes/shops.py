@@ -14,13 +14,14 @@ from app.api.auth import AuthenticatedAdmin, require_admin_session, require_csrf
 from app.api.dependencies import IdempotencyKey, ShopBindingId, database_session
 from app.api.errors import ERROR_RESPONSES
 from app.db.models import QuotaSnapshotModel, ScopeSnapshot, ShopBinding
-from app.domain.enums import AuthorizationStatus, ListingMode, Scope
+from app.domain.enums import ListingMode, Scope
 from app.use_cases.listing_mode import (
     ListingModeDecision,
     ManualListingModeConfirmation,
     assess_persisted_listing_mode,
     confirm_manual_listing_mode,
 )
+from app.use_cases.shop_access import shop_state_blockers, shop_token_blockers
 
 
 class _StrictModel(BaseModel):
@@ -85,24 +86,6 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def _authorization_blockers(binding: ShopBinding) -> list[str]:
-    return (
-        []
-        if binding.authorization_status == AuthorizationStatus.ACTIVE.value
-        else ["BLOCKED_SHOP_AUTHORIZATION"]
-    )
-
-
-def _token_blockers(scope: ScopeSnapshot | None, now: datetime) -> list[str]:
-    if scope is None:
-        return ["BLOCKED_SCOPE_SNAPSHOT"]
-    if scope.access_expires_at is None:
-        return ["BLOCKED_TOKEN_EXPIRY_UNKNOWN"]
-    if _utc(scope.access_expires_at) <= now:
-        return ["BLOCKED_ACCESS_TOKEN_EXPIRED"]
-    return []
-
-
 def _scope_blocker(
     scope: ScopeSnapshot | None,
     required: Scope | None,
@@ -146,16 +129,17 @@ def _summary(
     quota: QuotaSnapshotModel | None,
     now: datetime,
 ) -> ShopSummaryResponse:
-    authorization = _authorization_blockers(binding)
-    token = _token_blockers(scope, now)
+    access = [
+        *shop_state_blockers(binding),
+        *shop_token_blockers(scope, now=now),
+    ]
     unknown_mode = (
         ["BLOCKED_LISTING_MODE_UNKNOWN"]
         if binding.listing_mode == ListingMode.UNKNOWN.value
         else []
     )
     product_read_blockers = [
-        *authorization,
-        *token,
+        *access,
         *unknown_mode,
         *_scope_blocker(
             scope,
@@ -164,8 +148,7 @@ def _summary(
         ),
     ]
     product_write_blockers = [
-        *authorization,
-        *token,
+        *access,
         *unknown_mode,
         *_scope_blocker(
             scope,
@@ -175,8 +158,7 @@ def _summary(
         *_quota_blockers(binding, quota, now),
     ]
     order_read_blockers = [
-        *authorization,
-        *token,
+        *access,
         *_scope_blocker(scope, Scope.ORDER_INFO, "BLOCKED_ORDER_SCOPE"),
     ]
     return ShopSummaryResponse(
@@ -204,7 +186,7 @@ def _summary(
             if quota is not None
             else None
         ),
-        selectable=not authorization,
+        selectable=not access,
         product_read_enabled=not product_read_blockers,
         product_write_preconditions_met=not product_write_blockers,
         order_read_enabled=not order_read_blockers,

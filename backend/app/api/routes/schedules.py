@@ -15,13 +15,14 @@ from app.api.dependencies import UUID_PATTERN, ShopBindingId, commerce_runtime, 
 from app.api.errors import ERROR_RESPONSES, ApiProblem
 from app.api.runtime import CommerceRuntime
 from app.db.models import ScheduleJob, ScheduleRun, ShopBinding
-from app.domain.enums import AuthorizationStatus, WriteState
+from app.domain.enums import Scope, WriteState
 from app.repositories.audit import record_audit_fact
 from app.repositories.idempotency import (
     IdempotencyRequest,
     canonical_payload_hash,
     register_operation,
 )
+from app.use_cases.product_capabilities import evaluate_product_capabilities
 from app.use_cases.scheduler import (
     ScheduleCommand,
     ScheduleJobType,
@@ -31,6 +32,10 @@ from app.use_cases.scheduler import (
     create_schedule_job,
     list_schedule_jobs,
     list_schedule_runs,
+)
+from app.use_cases.shop_access import (
+    ShopAccessFactsBlocked,
+    require_operational_shop,
 )
 
 
@@ -125,29 +130,37 @@ async def schedule_capabilities(
     session: Annotated[AsyncSession, Depends(database_session)],
     runtime: Annotated[CommerceRuntime, Depends(commerce_runtime)],
 ) -> ScheduleCapabilitiesResponse:
-    shop = await _require_shop(session, shop_binding_id)
-    blockers: list[str] = []
-    if shop.authorization_status != AuthorizationStatus.ACTIVE.value:
-        blockers.append("BLOCKED_SHOP_AUTHORIZATION")
+    await _require_shop(session, shop_binding_id)
+    product = await evaluate_product_capabilities(
+        session,
+        shop_binding_id=shop_binding_id,
+        platform_configured=runtime.platform_configured,
+        key_ring=runtime.key_ring,
+        endpoint_evidence=runtime.product_capabilities,
+    )
+    order_blockers: list[str] = []
     if not runtime.platform_configured:
-        blockers.append("BLOCKED_LIVE_CREDENTIALS")
-    if not runtime.master_key_configured:
-        blockers.append("BLOCKED_MASTER_KEY")
-    if not runtime.product_capabilities.live_submission_validation_verified:
-        blockers.append("BLOCKED_UNVERIFIED_LIVE_PRODUCT_VALIDATION")
-    shop_active = shop.authorization_status == AuthorizationStatus.ACTIVE.value
+        order_blockers.append("BLOCKED_LIVE_CREDENTIALS")
+    if runtime.key_ring is None:
+        order_blockers.append("BLOCKED_MASTER_KEY")
+    try:
+        facts = await require_operational_shop(
+            session,
+            shop_binding_id=shop_binding_id,
+        )
+    except ShopAccessFactsBlocked as exc:
+        order_blockers.extend(exc.blockers)
+    else:
+        if Scope.ORDER_INFO.value not in set(facts.snapshot.granted_scopes):
+            order_blockers.append("BLOCKED_SCOPE:seller.order.info")
+    blockers = tuple(
+        dict.fromkeys((*product.product_submission_blockers, *order_blockers))
+    )
     return ScheduleCapabilitiesResponse(
         worker_enabled=True,
-        publish_draft_enabled=(
-            shop_active
-            and runtime.platform_configured
-            and runtime.master_key_configured
-            and runtime.product_capabilities.live_submission_validation_verified
-        ),
-        order_sync_enabled=(
-            shop_active and runtime.platform_configured and runtime.master_key_configured
-        ),
-        blockers=blockers,
+        publish_draft_enabled=product.product_submission_enabled,
+        order_sync_enabled=not order_blockers,
+        blockers=list(blockers),
     )
 
 
@@ -184,21 +197,23 @@ async def create_schedule(
     session: Annotated[AsyncSession, Depends(database_session)],
     runtime: Annotated[CommerceRuntime, Depends(commerce_runtime)],
 ) -> ScheduleResponse:
-    shop = await _require_shop(session, shop_binding_id)
-    if shop.authorization_status != AuthorizationStatus.ACTIVE.value:
-        raise ApiProblem(403, "SHOP_AUTHORIZATION_INACTIVE", "shop authorization is not active")
-    if payload.job_type is ScheduleJobType.PUBLISH_DRAFT and not (
-        runtime.platform_configured
-        and runtime.master_key_configured
-        and runtime.product_capabilities.live_submission_validation_verified
-    ):
-        raise ApiProblem(
-            503,
-            "SCHEDULE_PUBLICATION_BLOCKED",
-            "scheduled publication is unavailable until TikTok validation is verified",
+    await _require_shop(session, shop_binding_id)
+    if payload.job_type is ScheduleJobType.PUBLISH_DRAFT:
+        product = await evaluate_product_capabilities(
+            session,
+            shop_binding_id=shop_binding_id,
+            platform_configured=runtime.platform_configured,
+            key_ring=runtime.key_ring,
+            endpoint_evidence=runtime.product_capabilities,
         )
+        if not product.product_submission_enabled:
+            raise ApiProblem(
+                503,
+                "SCHEDULE_PUBLICATION_BLOCKED",
+                "scheduled publication is unavailable until commerce preconditions are met",
+            )
     if payload.job_type is ScheduleJobType.SYNC_ORDERS and not (
-        runtime.platform_configured and runtime.master_key_configured
+        runtime.platform_configured and runtime.key_ring is not None
     ):
         raise ApiProblem(
             503,
@@ -281,16 +296,28 @@ async def set_schedule_state(
     job = await session.get(ScheduleJob, schedule_job_id)
     if job is None or job.shop_binding_id != shop_binding_id:
         raise ApiProblem(404, "SCHEDULE_NOT_FOUND", "schedule was not found")
-    if payload.enabled:
-        shop = await _require_shop(session, shop_binding_id)
-        if shop.authorization_status != AuthorizationStatus.ACTIVE.value:
-            raise ApiProblem(403, "SHOP_AUTHORIZATION_INACTIVE", "shop authorization is not active")
-    if payload.enabled and job.job_type == ScheduleJobType.PUBLISH_DRAFT.value and not (
-        runtime.platform_configured
-        and runtime.master_key_configured
-        and runtime.product_capabilities.live_submission_validation_verified
+    if payload.enabled and job.job_type == ScheduleJobType.PUBLISH_DRAFT.value:
+        product = await evaluate_product_capabilities(
+            session,
+            shop_binding_id=shop_binding_id,
+            platform_configured=runtime.platform_configured,
+            key_ring=runtime.key_ring,
+            endpoint_evidence=runtime.product_capabilities,
+        )
+        if not product.product_submission_enabled:
+            raise ApiProblem(
+                503,
+                "SCHEDULE_PUBLICATION_BLOCKED",
+                "scheduled publication is unavailable",
+            )
+    if payload.enabled and job.job_type == ScheduleJobType.SYNC_ORDERS.value and not (
+        runtime.platform_configured and runtime.key_ring is not None
     ):
-        raise ApiProblem(503, "SCHEDULE_PUBLICATION_BLOCKED", "scheduled publication is unavailable")
+        raise ApiProblem(
+            503,
+            "SCHEDULE_ORDER_SYNC_BLOCKED",
+            "scheduled order synchronization is not configured",
+        )
     state_hash = canonical_payload_hash(
         {"schedule_job_id": schedule_job_id, "enabled": payload.enabled}
     )
@@ -315,12 +342,19 @@ async def set_schedule_state(
                 "the persisted schedule state no longer matches this completed request",
             )
         return _schedule_response(job)
-    changed = await change_schedule_state(
-        session,
-        shop_binding_id=shop_binding_id,
-        schedule_job_id=schedule_job_id,
-        enabled=payload.enabled,
-    )
+    try:
+        changed = await change_schedule_state(
+            session,
+            shop_binding_id=shop_binding_id,
+            schedule_job_id=schedule_job_id,
+            enabled=payload.enabled,
+        )
+    except ScheduleValidationError as exc:
+        raise ApiProblem(
+            422,
+            "SCHEDULE_REQUEST_INVALID",
+            "schedule request is invalid",
+        ) from exc
     if not changed:
         raise ApiProblem(409, "SCHEDULE_STATE_CONFLICT", "schedule state changed concurrently")
     operation.state = WriteState.ACTIVE.value

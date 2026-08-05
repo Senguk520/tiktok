@@ -18,10 +18,8 @@ from app.db.models import (
     QuotaSnapshotModel,
     ScheduleJob,
     ScheduleRun,
-    ShopBinding,
 )
 from app.domain.enums import (
-    AuthorizationStatus,
     ListingMode,
     ProductDraftStatus,
     Scope,
@@ -42,11 +40,16 @@ from app.use_cases.commerce_context import CommerceAccessBlocked, ShopAccessCont
 from app.use_cases.orders import OrderService
 from app.use_cases.products import (
     DraftSubmissionPreparation,
+    PreparedDraftSubmission,
     ProductService,
     ProductSubmissionBlocked,
     ProductSubmissionInProgress,
 )
-from app.use_cases.shop_access import load_shop_access_context
+from app.use_cases.shop_access import (
+    ShopAccessFactsBlocked,
+    load_shop_access_context,
+    require_operational_shop,
+)
 from shared.security import KeyRing
 
 Clock = Callable[[], datetime]
@@ -188,11 +191,17 @@ async def create_schedule_job(
         command,
         now=current,
     )
-    binding = await session.get(ShopBinding, shop_binding_id)
-    if binding is None:
-        raise ScheduleValidationError("shop binding was not found")
-    if binding.authorization_status != AuthorizationStatus.ACTIVE.value:
-        raise ScheduleValidationError("shop authorization is not active")
+    try:
+        facts = await require_operational_shop(
+            session,
+            shop_binding_id=shop_binding_id,
+            now=current,
+        )
+        binding = facts.binding
+        if not set(scopes).issubset(set(facts.snapshot.granted_scopes)):
+            raise ScheduleValidationError("shop scope requirements are not granted")
+    except ShopAccessFactsBlocked as exc:
+        raise ScheduleValidationError(str(exc)) from exc
     required_mode: str | None = None
     if mode_marker == "CURRENT":
         if binding.listing_mode == ListingMode.UNKNOWN.value:
@@ -272,12 +281,27 @@ async def change_schedule_state(
     enabled: bool,
     now: datetime | None = None,
 ) -> bool:
+    current = datetime.now(UTC) if now is None else _utc(now, field="now")
+    if enabled:
+        job = await session.get(ScheduleJob, schedule_job_id)
+        if job is None or job.shop_binding_id != shop_binding_id:
+            return False
+        try:
+            facts = await require_operational_shop(
+                session,
+                shop_binding_id=shop_binding_id,
+                now=current,
+            )
+        except ShopAccessFactsBlocked as exc:
+            raise ScheduleValidationError(str(exc)) from exc
+        if not set(job.required_scopes).issubset(set(facts.snapshot.granted_scopes)):
+            raise ScheduleValidationError("shop scope requirements are not granted")
     return await set_schedule_enabled(
         session,
         schedule_job_id=schedule_job_id,
         shop_binding_id=shop_binding_id,
         enabled=enabled,
-        now=now,
+        now=current,
     )
 
 
@@ -320,6 +344,7 @@ class CoreScheduleDispatcher:
                     session,
                     shop_binding_id=claim.shop_binding_id,
                     key_ring=self._key_ring,
+                    now=now,
                 )
             except CommerceAccessBlocked as exc:
                 raise ScheduleExecutionBlocked("schedule_shop_access_blocked") from exc
@@ -387,23 +412,59 @@ class CoreScheduleDispatcher:
         prepared = preparation.prepared
         if prepared is None:
             raise ScheduleExecutionFailed("schedule_product_preparation_invalid")
-        try:
-            submission = await self._product_service.execute_draft_submission(context, prepared)
-        except BaseException as exc:
+        if getattr(prepared, "reconciliation_required", False):
             try:
-                async with self._session_factory.begin() as session:
-                    await assert_schedule_lease(
-                        session,
-                        claim,
-                        worker_id=worker_id,
-                        now=self._clock(),
-                    )
-                    await self._product_service.fail_draft_submission(session, prepared, exc)
-            except ScheduleLeaseLost:
-                raise
-            except Exception as persistence_exc:
-                raise ScheduleExecutionFailed("schedule_product_failure_persistence_failed") from persistence_exc
-            raise ScheduleExecutionFailed("schedule_product_submission_failed") from exc
+                submission = await self._product_service.reconcile_draft_submission(
+                    context,
+                    prepared,
+                )
+            except BaseException as exc:
+                await self._require_product_manual_reconciliation(
+                    claim,
+                    prepared,
+                    worker_id=worker_id,
+                    reason=(
+                        "TikTok reconciliation could not confirm a unique remote product"
+                    ),
+                )
+                raise ScheduleExecutionBlocked("schedule_product_manual_review") from exc
+            if submission is None:
+                await self._require_product_manual_reconciliation(
+                    claim,
+                    prepared,
+                    worker_id=worker_id,
+                    reason=(
+                        "TikTok create cannot be uniquely reconciled from a complete same-mode search"
+                    ),
+                )
+                raise ScheduleExecutionBlocked("schedule_product_manual_review")
+        else:
+            try:
+                submission = await self._product_service.execute_draft_submission(
+                    context,
+                    prepared,
+                )
+            except BaseException as exc:
+                try:
+                    async with self._session_factory.begin() as session:
+                        await assert_schedule_lease(
+                            session,
+                            claim,
+                            worker_id=worker_id,
+                            now=self._clock(),
+                        )
+                        await self._product_service.fail_draft_submission(
+                            session,
+                            prepared,
+                            exc,
+                        )
+                except ScheduleLeaseLost:
+                    raise
+                except Exception as persistence_exc:
+                    raise ScheduleExecutionFailed(
+                        "schedule_product_failure_persistence_failed"
+                    ) from persistence_exc
+                raise ScheduleExecutionFailed("schedule_product_submission_failed") from exc
         async with self._session_factory.begin() as session:
             await assert_schedule_lease(
                 session,
@@ -420,6 +481,34 @@ class CoreScheduleDispatcher:
         return ScheduleDispatchResult(
             {"code": "schedule_product_submitted", "job_type": claim.job_type}
         )
+
+    async def _require_product_manual_reconciliation(
+        self,
+        claim: ClaimedScheduleJob,
+        prepared: PreparedDraftSubmission,
+        *,
+        worker_id: str,
+        reason: str,
+    ) -> None:
+        try:
+            async with self._session_factory.begin() as session:
+                await assert_schedule_lease(
+                    session,
+                    claim,
+                    worker_id=worker_id,
+                    now=self._clock(),
+                )
+                await self._product_service.require_manual_reconciliation(
+                    session,
+                    prepared,
+                    reason=reason,
+                )
+        except ScheduleLeaseLost:
+            raise
+        except Exception as exc:
+            raise ScheduleExecutionFailed(
+                "schedule_product_manual_review_persistence_failed"
+            ) from exc
 
     async def _sync_orders(
         self,
@@ -612,12 +701,17 @@ def _stored_utc(value: datetime) -> datetime:
 def _next_run(claim: ClaimedScheduleJob, *, now: datetime) -> tuple[datetime, bool]:
     if claim.schedule_kind == ScheduleKind.ONCE.value:
         return now, False
-    if claim.schedule_kind != ScheduleKind.INTERVAL.value or claim.interval_seconds is None:
+    interval_seconds = claim.interval_seconds
+    if (
+        claim.schedule_kind != ScheduleKind.INTERVAL.value
+        or interval_seconds is None
+        or interval_seconds <= 0
+    ):
         raise ScheduleExecutionBlocked("schedule_rule_invalid")
-    next_run = claim.scheduled_for + timedelta(seconds=claim.interval_seconds)
-    while next_run <= now:
-        next_run += timedelta(seconds=claim.interval_seconds)
-    return next_run, True
+    interval = timedelta(seconds=interval_seconds)
+    elapsed = now - claim.scheduled_for
+    intervals_to_advance = max(1, elapsed // interval + 1)
+    return claim.scheduled_for + intervals_to_advance * interval, True
 
 
 async def run_schedule_loop(

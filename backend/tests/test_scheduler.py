@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.base import DatabaseSettings, create_engine_and_session_factory
-from app.db.models import AuditLog, QuotaSnapshotModel, ScheduleJob, ScheduleRun, ShopBinding
-from app.domain.enums import AuthorizationStatus, ListingMode, Scope
+from app.db.models import (
+    AuditLog,
+    EncryptedCredential,
+    IdempotentOperation,
+    QuotaSnapshotModel,
+    ScheduleJob,
+    ScheduleRun,
+    ScopeSnapshot,
+    ShopBinding,
+)
+from app.domain.enums import AuthorizationStatus, ListingMode, Scope, WriteState
 from app.domain.scopes import ScopeSet
 from app.integrations.tiktok.oauth import TokenSet
 from app.integrations.tiktok.products import ProductSubmission
@@ -26,10 +36,15 @@ from app.use_cases.authorization import AuthorizedShop, bind_authorization, deau
 from app.use_cases.products import DraftSubmissionPreparation, PreparedDraftSubmission
 from app.use_cases.scheduler import (
     CoreScheduleDispatcher,
+    ScheduleCommand,
     ScheduleExecutionBlocked,
     ScheduleJobType,
     ScheduleKind,
+    ScheduleValidationError,
     ScheduleWorker,
+    _next_run,
+    change_schedule_state,
+    create_schedule_job,
 )
 from migrations.core import migrate_engine
 from shared.security import KeyRing, MasterKey
@@ -66,7 +81,15 @@ async def _seed_binding(
                 access_expires_at=now + timedelta(days=7),
                 refresh_expires_at=now + timedelta(days=30),
             ),
-            shops=(AuthorizedShop("scheduler-shop", "test-shop-cipher", "MY"),),
+            shops=(
+                AuthorizedShop(
+                    "scheduler-shop",
+                    "test-shop-cipher",
+                    "MY",
+                    shop_status="ACTIVE",
+                    kyc_status="VERIFIED",
+                ),
+            ),
             key=master,
             expected_scopes=scopes,
         )
@@ -267,7 +290,7 @@ def _claim_for(
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_rechecks_mode_scope_quota_and_authorization_before_write(
+async def test_dispatcher_rechecks_mode_scope_quota_and_operational_access_before_write(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 3, 14, 10, 0, tzinfo=UTC)
@@ -309,12 +332,178 @@ async def test_dispatcher_rechecks_mode_scope_quota_and_authorization_before_wri
                 await dispatcher.execute(claim, worker_id="guard-worker")
             assert caught.value.code == expected_code
 
+        for field, blocked_value, restored_value in (
+            (
+                "authorization_status",
+                AuthorizationStatus.DEAUTHORIZED.value,
+                AuthorizationStatus.ACTIVE.value,
+            ),
+            ("shop_status", "INACTIVE", "ACTIVE"),
+            ("kyc_status", "PENDING", "VERIFIED"),
+        ):
+            async with factory.begin() as session:
+                binding = await session.get(ShopBinding, binding_id)
+                assert binding is not None
+                setattr(binding, field, blocked_value)
+            with pytest.raises(ScheduleExecutionBlocked) as caught:
+                await dispatcher.execute(
+                    _claim_for(binding_id, now),
+                    worker_id="guard-worker",
+                )
+            assert caught.value.code == "schedule_shop_access_blocked"
+            async with factory.begin() as session:
+                binding = await session.get(ShopBinding, binding_id)
+                assert binding is not None
+                setattr(binding, field, restored_value)
+
         async with factory.begin() as session:
-            await deauthorize_shop(session, binding_id, now=now)
+            snapshot = await session.scalar(
+                select(ScopeSnapshot)
+                .where(ScopeSnapshot.shop_binding_id == binding_id)
+                .order_by(ScopeSnapshot.captured_at.desc(), ScopeSnapshot.id.desc())
+                .limit(1)
+            )
+            assert snapshot is not None
+            snapshot.access_expires_at = now
+        with pytest.raises(ScheduleExecutionBlocked) as caught:
+            await dispatcher.execute(_claim_for(binding_id, now), worker_id="guard-worker")
+        assert caught.value.code == "schedule_shop_access_blocked"
+
+        async with factory.begin() as session:
+            snapshot = await session.scalar(
+                select(ScopeSnapshot)
+                .where(ScopeSnapshot.shop_binding_id == binding_id)
+                .order_by(ScopeSnapshot.captured_at.desc(), ScopeSnapshot.id.desc())
+                .limit(1)
+            )
+            credential = await session.scalar(
+                select(EncryptedCredential)
+                .where(
+                    EncryptedCredential.owner_kind == "authorization",
+                    EncryptedCredential.credential_kind == "access_token",
+                )
+                .order_by(
+                    EncryptedCredential.updated_at.desc(),
+                    EncryptedCredential.id.desc(),
+                )
+                .limit(1)
+            )
+            assert snapshot is not None and credential is not None
+            snapshot.access_expires_at = now + timedelta(hours=1)
+            credential.active = False
         with pytest.raises(ScheduleExecutionBlocked) as caught:
             await dispatcher.execute(_claim_for(binding_id, now), worker_id="guard-worker")
         assert caught.value.code == "schedule_shop_access_blocked"
         assert product_service.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_schedule_creation_uses_the_same_operational_shop_guard(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 3, 14, 10, 30, tzinfo=UTC)
+    engine, factory = await _factory(tmp_path / "schedule-create-guards.sqlite3")
+    command = ScheduleCommand(
+        job_type=ScheduleJobType.SYNC_ORDERS,
+        schedule_kind=ScheduleKind.ONCE,
+        run_at=now,
+        payload={"window_seconds": 3600, "page_size": 20, "max_pages": 2},
+    )
+    try:
+        binding_id, _key_ring = await _seed_binding(
+            factory,
+            now=now,
+            scopes=(Scope.ORDER_INFO,),
+        )
+        async with factory.begin() as session:
+            job = await create_schedule_job(
+                session,
+                shop_binding_id=binding_id,
+                command=command,
+                now=now,
+            )
+            assert job.enabled
+            job_id = job.id
+
+        async with factory.begin() as session:
+            assert await change_schedule_state(
+                session,
+                shop_binding_id=binding_id,
+                schedule_job_id=job_id,
+                enabled=False,
+                now=now,
+            )
+            snapshot = await session.scalar(
+                select(ScopeSnapshot)
+                .where(ScopeSnapshot.shop_binding_id == binding_id)
+                .order_by(ScopeSnapshot.captured_at.desc(), ScopeSnapshot.id.desc())
+                .limit(1)
+            )
+            assert snapshot is not None
+            snapshot.granted_scopes = []
+            snapshot.missing_scopes = [Scope.ORDER_INFO.value]
+        async with factory.begin() as session:
+            with pytest.raises(ScheduleValidationError):
+                await create_schedule_job(
+                    session,
+                    shop_binding_id=binding_id,
+                    command=command,
+                    now=now,
+                )
+            with pytest.raises(ScheduleValidationError):
+                await change_schedule_state(
+                    session,
+                    shop_binding_id=binding_id,
+                    schedule_job_id=job_id,
+                    enabled=True,
+                    now=now,
+                )
+        async with factory.begin() as session:
+            snapshot = await session.scalar(
+                select(ScopeSnapshot)
+                .where(ScopeSnapshot.shop_binding_id == binding_id)
+                .order_by(ScopeSnapshot.captured_at.desc(), ScopeSnapshot.id.desc())
+                .limit(1)
+            )
+            assert snapshot is not None
+            snapshot.granted_scopes = [Scope.ORDER_INFO.value]
+            snapshot.missing_scopes = []
+
+        async with factory.begin() as session:
+            binding = await session.get(ShopBinding, binding_id)
+            assert binding is not None
+            binding.kyc_status = "PENDING"
+        async with factory.begin() as session:
+            with pytest.raises(ScheduleValidationError):
+                await create_schedule_job(
+                    session,
+                    shop_binding_id=binding_id,
+                    command=command,
+                    now=now,
+                )
+
+        async with factory.begin() as session:
+            binding = await session.get(ShopBinding, binding_id)
+            assert binding is not None
+            binding.kyc_status = "VERIFIED"
+            snapshot = await session.scalar(
+                select(ScopeSnapshot)
+                .where(ScopeSnapshot.shop_binding_id == binding_id)
+                .order_by(ScopeSnapshot.captured_at.desc(), ScopeSnapshot.id.desc())
+                .limit(1)
+            )
+            assert snapshot is not None
+            snapshot.access_expires_at = now
+        async with factory.begin() as session:
+            with pytest.raises(ScheduleValidationError):
+                await create_schedule_job(
+                    session,
+                    shop_binding_id=binding_id,
+                    command=command,
+                    now=now,
+                )
     finally:
         await engine.dispose()
 
@@ -447,3 +636,258 @@ async def test_schedule_worker_commits_claim_before_platform_call_and_finishes_o
             assert boundary is not None
     finally:
         await engine.dispose()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationPrepared:
+    draft_id: str
+    operation_id: str
+    product: Any = None
+    quota_snapshot_id: str | None = None
+    reconciliation_required: bool = True
+
+
+class _ReconciliationProductService:
+    def __init__(self, submission: ProductSubmission | None) -> None:
+        self._submission = submission
+        self.events: list[str] = []
+        self.create_calls = 0
+        self.operation_id = "66666666-6666-4666-8666-666666666666"
+
+    async def prepare_draft_submission(
+        self,
+        _session: AsyncSession,
+        _context: Any,
+        *,
+        draft_id: str,
+        idempotency_key: str,
+    ) -> DraftSubmissionPreparation:
+        assert idempotency_key.startswith("schedule:")
+        self.events.append("prepare")
+        return DraftSubmissionPreparation(
+            prepared=_ReconciliationPrepared(
+                draft_id=draft_id,
+                operation_id=self.operation_id,
+            )  # type: ignore[arg-type]
+        )
+
+    async def reconcile_draft_submission(
+        self,
+        _context: Any,
+        _prepared: Any,
+    ) -> ProductSubmission | None:
+        self.events.append("reconcile")
+        return self._submission
+
+    async def execute_draft_submission(self, *_args: Any, **_kwargs: Any) -> Any:
+        self.create_calls += 1
+        raise AssertionError("reconciliation-required work must never call create")
+
+    async def require_manual_reconciliation(
+        self,
+        session: AsyncSession,
+        prepared: Any,
+        *,
+        reason: str,
+    ) -> None:
+        self.events.append("manual_review")
+        operation = await session.get(IdempotentOperation, prepared.operation_id)
+        assert operation is not None
+        assert operation.state == WriteState.SUBMITTED.value
+        operation.state = WriteState.MANUAL_REVIEW.value
+        operation.manual_review_reason = reason
+
+    async def complete_draft_submission(
+        self,
+        session: AsyncSession,
+        _context: Any,
+        prepared: PreparedDraftSubmission,
+        submission: ProductSubmission,
+    ) -> object:
+        assert session.in_transaction()
+        self.events.append("complete")
+        operation = await session.get(IdempotentOperation, prepared.operation_id)
+        assert operation is not None
+        operation.state = WriteState.AUDITING.value
+        operation.result_reference = submission.product_id
+        return object()
+
+
+async def _seed_reconciliation_operation(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    shop_binding_id: str,
+    operation_id: str,
+) -> None:
+    async with factory.begin() as session:
+        session.add(
+            IdempotentOperation(
+                id=operation_id,
+                shop_binding_id=shop_binding_id,
+                operation="CREATE",
+                business_key="scheduled-reconciliation",
+                payload_hash="a" * 64,
+                idempotency_key_hash="b" * 64,
+                state=WriteState.SUBMITTED.value,
+            )
+        )
+
+
+async def _run_reconciliation_job(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    binding_id: str,
+    key_ring: KeyRing,
+    product_service: _ReconciliationProductService,
+    now: datetime,
+) -> tuple[str, str | None]:
+    await _seed_reconciliation_operation(
+        factory,
+        shop_binding_id=binding_id,
+        operation_id=product_service.operation_id,
+    )
+    await _seed_due_job(
+        factory,
+        shop_binding_id=binding_id,
+        now=now,
+        job_type=ScheduleJobType.PUBLISH_DRAFT.value,
+        required_scopes=[Scope.PRODUCT_WRITE.value],
+        required_listing_mode=ListingMode.LOCAL_REPLICATION.value,
+        payload={"draft_id": "77777777-7777-4777-8777-777777777777"},
+    )
+    dispatcher = CoreScheduleDispatcher(
+        session_factory=factory,
+        key_ring=key_ring,
+        product_service=product_service,  # type: ignore[arg-type]
+        order_service=_NeverOrderService(),  # type: ignore[arg-type]
+        clock=lambda: now,
+    )
+    worker = ScheduleWorker(
+        session_factory=factory,
+        dispatcher=dispatcher,
+        worker_id="reconciliation-worker",
+        lease_seconds=30,
+        clock=lambda: now,
+    )
+    outcome = (await worker.run_once())[0]
+    return outcome.state, outcome.error_code
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reconciles_unique_remote_product_without_create(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 3, 14, 12, 0, tzinfo=UTC)
+    engine, factory = await _factory(tmp_path / "schedule-reconcile-unique.sqlite3")
+    try:
+        binding_id, key_ring = await _seed_binding(factory, now=now)
+        product_service = _ReconciliationProductService(
+            ProductSubmission(
+                mode=ListingMode.LOCAL_REPLICATION,
+                product_id="reconciled-product",
+                request_id=None,
+            )
+        )
+        state, error_code = await _run_reconciliation_job(
+            factory,
+            binding_id=binding_id,
+            key_ring=key_ring,
+            product_service=product_service,
+            now=now,
+        )
+        assert (state, error_code) == ("SUCCEEDED", None)
+        assert product_service.events == ["prepare", "reconcile", "complete"]
+        assert product_service.create_calls == 0
+        async with factory() as session:
+            operation = await session.get(
+                IdempotentOperation,
+                product_service.operation_id,
+            )
+            assert operation is not None
+            assert operation.state == WriteState.AUDITING.value
+            assert operation.result_reference == "reconciled-product"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_persists_manual_review_when_reconciliation_is_not_unique(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 3, 14, 13, 0, tzinfo=UTC)
+    engine, factory = await _factory(tmp_path / "schedule-reconcile-manual.sqlite3")
+    try:
+        binding_id, key_ring = await _seed_binding(factory, now=now)
+        product_service = _ReconciliationProductService(None)
+        state, error_code = await _run_reconciliation_job(
+            factory,
+            binding_id=binding_id,
+            key_ring=key_ring,
+            product_service=product_service,
+            now=now,
+        )
+        assert (state, error_code) == ("BLOCKED", "schedule_product_manual_review")
+        assert product_service.events == ["prepare", "reconcile", "manual_review"]
+        assert product_service.create_calls == 0
+        async with factory() as session:
+            operation = await session.get(
+                IdempotentOperation,
+                product_service.operation_id,
+            )
+            assert operation is not None
+            assert operation.state == WriteState.MANUAL_REVIEW.value
+            assert operation.manual_review_reason is not None
+    finally:
+        await engine.dispose()
+
+
+def _interval_claim(
+    scheduled_for: datetime,
+    *,
+    interval_seconds: int,
+) -> ClaimedScheduleJob:
+    return replace(
+        _claim_for("88888888-8888-4888-8888-888888888888", scheduled_for),
+        schedule_kind=ScheduleKind.INTERVAL.value,
+        interval_seconds=interval_seconds,
+        run_at=None,
+    )
+
+
+def test_next_interval_run_catches_up_after_long_downtime_in_one_calculation() -> None:
+    scheduled_for = datetime(2000, 1, 1, tzinfo=UTC)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    next_run, enabled = _next_run(
+        _interval_claim(scheduled_for, interval_seconds=60),
+        now=now,
+    )
+    assert enabled
+    assert next_run == now + timedelta(minutes=1)
+    assert now < next_run <= now + timedelta(seconds=60)
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    (
+        (
+            datetime(2026, 3, 14, 11, 59, 59, tzinfo=UTC),
+            datetime(2026, 3, 14, 12, 0, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 3, 14, 12, 0, tzinfo=UTC),
+            datetime(2026, 3, 14, 13, 0, tzinfo=UTC),
+        ),
+    ),
+)
+def test_next_interval_run_is_strictly_after_now_at_hour_boundaries(
+    now: datetime,
+    expected: datetime,
+) -> None:
+    claim = _interval_claim(
+        datetime(2026, 3, 14, 8, 0, tzinfo=UTC),
+        interval_seconds=3600,
+    )
+    next_run, enabled = _next_run(claim, now=now)
+    assert enabled
+    assert next_run == expected
+    assert next_run > now
