@@ -24,6 +24,7 @@ from app.integrations.tiktok.products import ProductGatewayError
 from app.repositories.catalog import DraftConflict, DraftNotFound, ListingQuotaBlocked
 from app.repositories.idempotency import IdempotencyConflict
 from app.use_cases.commerce_context import CommerceAccessBlocked
+from app.use_cases.listing_mode import ListingModeBlocked
 from app.use_cases.products import ProductSubmissionBlocked, ProductSubmissionInProgress
 from shared.security import AuthenticationError, SecurityConfigurationError
 
@@ -114,7 +115,7 @@ def _map_exception(exc: Exception) -> _MappedFailure:
         return _MappedFailure(409, "OPERATION_CONFLICT", "operation conflicts with persisted state")
     if isinstance(exc, ListingQuotaBlocked):
         return _MappedFailure(409, "LISTING_QUOTA_BLOCKED", "confirmed listing quota does not allow submission")
-    if isinstance(exc, (CommerceAccessBlocked, ProductSubmissionBlocked)):
+    if isinstance(exc, (CommerceAccessBlocked, ListingModeBlocked, ProductSubmissionBlocked)):
         return _MappedFailure(403, "COMMERCE_ACCESS_BLOCKED", "commerce preconditions are not satisfied")
     if isinstance(exc, (ProductGatewayError, OrderGatewayError, OrderPayloadError)):
         return _MappedFailure(502, "TIKTOK_RESPONSE_INVALID", "TikTok returned an invalid business response")

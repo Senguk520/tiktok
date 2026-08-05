@@ -5,16 +5,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, Response
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import AuthenticatedAdmin, require_admin_session
-from app.api.dependencies import database_session
+from app.api.auth import AuthenticatedAdmin, require_admin_session, require_csrf
+from app.api.dependencies import IdempotencyKey, ShopBindingId, database_session
 from app.api.errors import ERROR_RESPONSES
 from app.db.models import QuotaSnapshotModel, ScopeSnapshot, ShopBinding
 from app.domain.enums import AuthorizationStatus, ListingMode, Scope
+from app.use_cases.listing_mode import (
+    ListingModeDecision,
+    ManualListingModeConfirmation,
+    assess_persisted_listing_mode,
+    confirm_manual_listing_mode,
+)
 
 
 class _StrictModel(BaseModel):
@@ -55,6 +61,21 @@ class ShopSummaryResponse(_StrictModel):
 
 class ShopListResponse(_StrictModel):
     items: list[ShopSummaryResponse]
+
+
+class ListingModeConfirmationRequest(_StrictModel):
+    target_shop_id: str = Field(min_length=1, max_length=128)
+    mode: ListingMode
+    local_read_verified: bool
+    global_read_verified: bool
+
+
+class ListingModeDecisionResponse(_StrictModel):
+    mode: ListingMode
+    writable: bool
+    evidence: list[str]
+    blockers: list[str]
+    recorded_evidence_id: str | None = None
 
 
 router = APIRouter(prefix="/api/shops", tags=["shops"], responses=ERROR_RESPONSES)
@@ -190,6 +211,69 @@ def _summary(
         product_read_blockers=product_read_blockers,
         product_write_blockers=product_write_blockers,
         order_read_blockers=order_read_blockers,
+    )
+
+
+def _listing_mode_response(
+    decision: ListingModeDecision,
+    *,
+    recorded_evidence_id: str | None = None,
+) -> ListingModeDecisionResponse:
+    return ListingModeDecisionResponse(
+        mode=decision.mode,
+        writable=decision.writable,
+        evidence=list(decision.evidence),
+        blockers=list(decision.blockers),
+        recorded_evidence_id=recorded_evidence_id,
+    )
+
+
+@router.get(
+    "/{shop_binding_id}/listing-mode",
+    response_model=ListingModeDecisionResponse,
+)
+async def get_listing_mode(
+    shop_binding_id: ShopBindingId,
+    _admin: Annotated[AuthenticatedAdmin, Depends(require_admin_session)],
+    session: Annotated[AsyncSession, Depends(database_session)],
+) -> ListingModeDecisionResponse:
+    decision = await assess_persisted_listing_mode(
+        session,
+        shop_binding_id=shop_binding_id,
+    )
+    return _listing_mode_response(decision)
+
+
+@router.post(
+    "/{shop_binding_id}/listing-mode-confirmations",
+    response_model=ListingModeDecisionResponse,
+    status_code=201,
+)
+async def record_listing_mode_confirmation(
+    shop_binding_id: ShopBindingId,
+    payload: ListingModeConfirmationRequest,
+    response: Response,
+    idempotency_key: IdempotencyKey,
+    admin: Annotated[AuthenticatedAdmin, Depends(require_csrf)],
+    session: Annotated[AsyncSession, Depends(database_session)],
+) -> ListingModeDecisionResponse:
+    result = await confirm_manual_listing_mode(
+        session,
+        shop_binding_id=shop_binding_id,
+        actor_session_id=admin.session_id,
+        idempotency_key=idempotency_key,
+        confirmation=ManualListingModeConfirmation(
+            target_shop_id=payload.target_shop_id,
+            mode=payload.mode,
+            local_read_verified=payload.local_read_verified,
+            global_read_verified=payload.global_read_verified,
+        ),
+    )
+    if result.replayed:
+        response.status_code = 200
+    return _listing_mode_response(
+        result.decision,
+        recorded_evidence_id=result.recorded_evidence_id,
     )
 
 

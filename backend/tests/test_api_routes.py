@@ -14,6 +14,8 @@ from sqlalchemy import select
 from app.api.dependencies import commerce_runtime, shop_access_context
 from app.db.models import (
     AdminSession,
+    AuditLog,
+    ListingModeEvidence,
     ProductDraft,
     QuotaSnapshotModel,
     ScopeSnapshot,
@@ -203,6 +205,153 @@ def test_shop_registry_exposes_only_safe_capability_facts_and_blocks_inactive_se
         "ciphertext",
     ):
         assert forbidden not in serialized
+
+
+def test_listing_mode_confirmation_is_strict_durable_and_conflicts_to_unknown(
+    api_client: tuple[TestClient, object],
+) -> None:
+    client, test_app = api_client
+    csrf, _cookie = _login(client)
+    now = datetime.now(UTC)
+
+    async def seed() -> None:
+        async with test_app.state.db_session_factory.begin() as session:
+            binding = ShopBinding(
+                id=_SHOP_ID,
+                open_id="listing-mode-owner",
+                shop_id="listing-mode-target",
+                region="MY",
+                shop_status="ACTIVE",
+                kyc_status="VERIFIED",
+                listing_mode=ListingMode.UNKNOWN.value,
+                authorization_status=AuthorizationStatus.ACTIVE.value,
+            )
+            session.add(binding)
+            await session.flush()
+            session.add(
+                ScopeSnapshot(
+                    shop_binding_id=_SHOP_ID,
+                    granted_scopes=[
+                        Scope.PRODUCT_BASIC.value,
+                        Scope.PRODUCT_WRITE.value,
+                    ],
+                    missing_scopes=[],
+                    captured_at=now,
+                    access_expires_at=now + timedelta(hours=1),
+                )
+            )
+
+    asyncio.run(seed())
+    path = f"/api/shops/{_SHOP_ID}/listing-mode-confirmations"
+    wrong_target = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "listing-mode-wrong-target-key",
+        },
+        json={
+            "target_shop_id": "different-shop",
+            "mode": "LOCAL_REPLICATION",
+            "local_read_verified": True,
+            "global_read_verified": False,
+        },
+    )
+    assert wrong_target.status_code == 403
+    assert wrong_target.json()["error"]["code"] == "COMMERCE_ACCESS_BLOCKED"
+
+    confirmed = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "listing-mode-confirm-key",
+        },
+        json={
+            "target_shop_id": "listing-mode-target",
+            "mode": "LOCAL_REPLICATION",
+            "local_read_verified": True,
+            "global_read_verified": False,
+        },
+    )
+    assert confirmed.status_code == 201
+    assert confirmed.json()["mode"] == "LOCAL_REPLICATION"
+    assert confirmed.json()["writable"] is True
+    evidence_id = confirmed.json()["recorded_evidence_id"]
+    assert evidence_id
+
+    replayed = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "listing-mode-confirm-key",
+        },
+        json={
+            "target_shop_id": "listing-mode-target",
+            "mode": "LOCAL_REPLICATION",
+            "local_read_verified": True,
+            "global_read_verified": False,
+        },
+    )
+    assert replayed.status_code == 200
+    assert replayed.json()["recorded_evidence_id"] == evidence_id
+    assert replayed.json()["mode"] == "LOCAL_REPLICATION"
+
+    replay_conflict = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "listing-mode-confirm-key",
+        },
+        json={
+            "target_shop_id": "listing-mode-target",
+            "mode": "GLOBAL_LEGACY",
+            "local_read_verified": False,
+            "global_read_verified": True,
+        },
+    )
+    assert replay_conflict.status_code == 409
+
+    conflict = client.post(
+        path,
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "listing-mode-conflict-key",
+        },
+        json={
+            "target_shop_id": "listing-mode-target",
+            "mode": "GLOBAL_LEGACY",
+            "local_read_verified": False,
+            "global_read_verified": True,
+        },
+    )
+    assert conflict.status_code == 201
+    assert conflict.json()["mode"] == "UNKNOWN"
+    assert conflict.json()["writable"] is False
+    assert conflict.json()["blockers"] == ["conflicting listing-mode evidence"]
+    current = client.get(f"/api/shops/{_SHOP_ID}/listing-mode")
+    assert current.status_code == 200
+    assert current.json()["mode"] == "UNKNOWN"
+
+    async def persisted_facts() -> tuple[ShopBinding | None, tuple[ListingModeEvidence, ...], tuple[AuditLog, ...]]:
+        async with test_app.state.db_session_factory() as session:
+            binding = await session.get(ShopBinding, _SHOP_ID)
+            evidence = tuple(
+                await session.scalars(
+                    select(ListingModeEvidence).order_by(ListingModeEvidence.recorded_at)
+                )
+            )
+            audits = tuple(
+                await session.scalars(select(AuditLog).order_by(AuditLog.created_at))
+            )
+            return binding, evidence, audits
+
+    binding, evidence, audits = asyncio.run(persisted_facts())
+    assert binding is not None and binding.listing_mode == ListingMode.UNKNOWN.value
+    assert len(evidence) == 2
+    assert evidence[0].read_only_endpoint == "/product/202502/products/search"
+    assert evidence[1].read_only_endpoint == "/product/202312/global_products/search"
+    assert evidence[1].conflict is True
+    assert [audit.outcome for audit in audits] == ["SUCCESS", "BLOCKED"]
+    assert all(audit.event_type == "listing_mode.confirmed" for audit in audits)
 
 
 def test_session_cookie_is_httponly_and_only_digests_are_persisted(

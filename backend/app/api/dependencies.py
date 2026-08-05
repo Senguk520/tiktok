@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends, Path, Request
+from fastapi import Depends, Header, Path, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.errors import ApiProblem
@@ -21,6 +21,15 @@ UUID_PATTERN = (
 ShopBindingId = Annotated[
     str,
     Path(min_length=36, max_length=36, pattern=UUID_PATTERN),
+]
+IdempotencyKey = Annotated[
+    str,
+    Header(
+        alias="Idempotency-Key",
+        min_length=16,
+        max_length=255,
+        pattern=r"^[!-~]{16,255}$",
+    ),
 ]
 
 
