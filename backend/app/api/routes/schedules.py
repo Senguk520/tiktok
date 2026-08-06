@@ -6,12 +6,18 @@ import hashlib
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, Path, Query, Request
+from fastapi import APIRouter, Depends, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import AuthenticatedAdmin, require_admin_session, require_csrf
-from app.api.dependencies import UUID_PATTERN, ShopBindingId, commerce_runtime, database_session
+from app.api.dependencies import (
+    UUID_PATTERN,
+    IdempotencyKey,
+    ShopBindingId,
+    commerce_runtime,
+    database_session,
+)
 from app.api.errors import ERROR_RESPONSES, ApiProblem
 from app.api.runtime import CommerceRuntime
 from app.db.models import ScheduleJob, ScheduleRun, ShopBinding
@@ -188,10 +194,7 @@ async def schedules(
 async def create_schedule(
     shop_binding_id: ShopBindingId,
     payload: ScheduleCreateInput,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=16, max_length=255),
-    ],
+    idempotency_key: IdempotencyKey,
     request: Request,
     admin: Annotated[AuthenticatedAdmin, Depends(require_csrf)],
     session: Annotated[AsyncSession, Depends(database_session)],
@@ -284,10 +287,7 @@ async def set_schedule_state(
         Path(min_length=36, max_length=36, pattern=UUID_PATTERN),
     ],
     payload: ScheduleStateInput,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=16, max_length=255),
-    ],
+    idempotency_key: IdempotencyKey,
     request: Request,
     admin: Annotated[AuthenticatedAdmin, Depends(require_csrf)],
     session: Annotated[AsyncSession, Depends(database_session)],

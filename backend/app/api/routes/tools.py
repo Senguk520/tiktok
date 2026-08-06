@@ -6,12 +6,18 @@ import hashlib
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.auth import AuthenticatedAdmin, require_admin_session, require_csrf
-from app.api.dependencies import ShopBindingId, commerce_runtime, database_session, session_factory
+from app.api.dependencies import (
+    IdempotencyKey,
+    ShopBindingId,
+    commerce_runtime,
+    database_session,
+    session_factory,
+)
 from app.api.errors import ERROR_RESPONSES, ApiProblem
 from app.api.runtime import CommerceRuntime
 from app.db.models import IdempotentOperation, ShopBinding
@@ -159,10 +165,7 @@ async def tools_capabilities(
 async def translate_text(
     shop_binding_id: ShopBindingId,
     payload: TranslationInput,
-    idempotency_key: Annotated[
-        str,
-        Header(alias="Idempotency-Key", min_length=16, max_length=255),
-    ],
+    idempotency_key: IdempotencyKey,
     request: Request,
     admin: Annotated[AuthenticatedAdmin, Depends(require_csrf)],
     factory: Annotated[async_sessionmaker[AsyncSession], Depends(session_factory)],

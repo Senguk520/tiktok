@@ -42,6 +42,7 @@ class Endpoint:
     retry: RetryPolicy
     idempotency: IdempotencyPolicy = IdempotencyPolicy.NONE
     enabled: bool = True
+    verified: bool = True
     official_anomaly: str | None = None
 
     def build_path(self, **path_parameters: str) -> str:
@@ -55,7 +56,7 @@ class Endpoint:
 
     @property
     def automatic_retry_allowed(self) -> bool:
-        return self.enabled and self.retry in {
+        return self.enabled and self.verified and self.retry in {
             RetryPolicy.SAFE_READ,
             RetryPolicy.IDEMPOTENT_WRITE,
             RetryPolicy.RECONCILE_THEN_RETRY,
@@ -72,6 +73,7 @@ def _endpoint(
     retry: RetryPolicy,
     idempotency: IdempotencyPolicy = IdempotencyPolicy.NONE,
     enabled: bool = True,
+    verified: bool = True,
     official_anomaly: str | None = None,
 ) -> Endpoint:
     segments = path.split("/")
@@ -89,6 +91,7 @@ def _endpoint(
         retry=retry,
         idempotency=idempotency,
         enabled=enabled,
+        verified=verified,
         official_anomaly=official_anomaly,
     )
 
@@ -126,6 +129,7 @@ _ITEMS = (
         write=True,
         retry=RetryPolicy.NEVER,
         enabled=False,
+        verified=False,
         official_anomaly="exact official image-upload contract is not present in the verified evidence set",
     ),
     _endpoint(
@@ -251,6 +255,7 @@ _ITEMS = (
         write=True,
         retry=RetryPolicy.NEVER,
         enabled=False,
+        verified=False,
         official_anomaly="official method/description and scope metadata conflict",
     ),
     _endpoint(
@@ -311,11 +316,18 @@ if len({item.key for item in _ITEMS}) != len(_ITEMS):
 ENDPOINTS: Mapping[str, Endpoint] = MappingProxyType({item.key: item for item in _ITEMS})
 
 
-def endpoint(key: str, *, require_enabled: bool = True) -> Endpoint:
+def endpoint(
+    key: str,
+    *,
+    require_enabled: bool = True,
+    require_verified: bool = True,
+) -> Endpoint:
     try:
         selected = ENDPOINTS[key]
     except KeyError as exc:
         raise KeyError(f"unknown TikTok endpoint: {key}") from exc
+    if require_verified and not selected.verified:
+        raise PermissionError(f"TikTok endpoint is unverified: {key}")
     if require_enabled and not selected.enabled:
         raise PermissionError(f"TikTok endpoint is disabled: {key}")
     return selected

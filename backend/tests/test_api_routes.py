@@ -106,13 +106,23 @@ def test_business_routes_require_session_and_report_blocked_capabilities(
     assert response.json() == {
         "platform_configured": False,
         "master_key_configured": False,
+        "listing_mode": "UNKNOWN",
         "image_upload_enabled": False,
         "product_submission_enabled": False,
+        "image_upload_blockers": [
+            "BLOCKED_LIVE_CREDENTIALS",
+            "BLOCKED_MASTER_KEY",
+            "BLOCKED_SHOP_BINDING",
+        ],
+        "product_submission_blockers": [
+            "BLOCKED_LIVE_CREDENTIALS",
+            "BLOCKED_MASTER_KEY",
+            "BLOCKED_SHOP_BINDING",
+        ],
         "blockers": [
             "BLOCKED_LIVE_CREDENTIALS",
             "BLOCKED_MASTER_KEY",
-            "BLOCKED_UNVERIFIED_IMAGE_UPLOAD_ENDPOINT",
-            "BLOCKED_UNVERIFIED_LIVE_PRODUCT_VALIDATION",
+            "BLOCKED_SHOP_BINDING",
         ],
     }
     assert response.headers["cache-control"].startswith("no-store")
@@ -440,6 +450,63 @@ def test_product_draft_contract_maps_only_normalized_business_fields(
     serialized = response.text.lower()
     assert "access_token" not in serialized
     assert "shop_cipher" not in serialized
+
+
+def test_browser_submission_route_delegates_transaction_boundaries_to_service(
+    api_client: tuple[TestClient, object],
+) -> None:
+    client, test_app = api_client
+    csrf, _cookie = _login(client)
+    observed: dict[str, object] = {}
+
+    class ContractProductService:
+        async def submit_draft(
+            self,
+            factory: object,
+            context: ShopAccessContext,
+            *,
+            draft_id: str,
+            idempotency_key: str,
+        ) -> object:
+            observed.update(
+                factory=factory,
+                context=context,
+                draft_id=draft_id,
+                idempotency_key=idempotency_key,
+            )
+            return SimpleNamespace(
+                submission=SimpleNamespace(
+                    mode=ListingMode.LOCAL_REPLICATION,
+                    product_id="product-1",
+                    request_id="request-1",
+                ),
+                operation_id="operation-1",
+                replayed=False,
+            )
+
+    async def access_override() -> ShopAccessContext:
+        return _context()
+
+    test_app.dependency_overrides[shop_access_context] = access_override
+    test_app.dependency_overrides[commerce_runtime] = lambda: SimpleNamespace(
+        product_service=ContractProductService()
+    )
+    draft_id = "22222222-2222-4222-8222-222222222222"
+    try:
+        response = client.post(
+            f"/api/shops/{_SHOP_ID}/products/drafts/{draft_id}/submit",
+            headers={
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "browser-submit-key",
+            },
+        )
+    finally:
+        test_app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.json()["product_id"] == "product-1"
+    assert observed["factory"] is test_app.state.db_session_factory
+    assert observed["draft_id"] == draft_id
+    assert observed["idempotency_key"] == "browser-submit-key"
 
 
 def test_order_contract_uses_only_pii_minimized_domain_facts(

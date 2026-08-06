@@ -66,6 +66,18 @@ _DELETE_ENDPOINTS = {
 }
 
 
+def product_create_chain_endpoint_keys(mode: ListingMode) -> tuple[str, ...]:
+    """Return the exact registered chain required for safe create recovery."""
+
+    try:
+        create_key, _create_scope = _CREATE_ENDPOINTS[mode]
+        search_key, _search_scope = _SEARCH_ENDPOINTS[mode]
+        detail_key, _parameter, _detail_scope = _GET_ENDPOINTS[mode]
+    except KeyError as exc:
+        raise CommerceAccessBlocked("listing mode has no registered product create chain") from exc
+    return ("product.image.upload", create_key, search_key, detail_key)
+
+
 _RouteValue = TypeVar("_RouteValue")
 
 

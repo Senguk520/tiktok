@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
@@ -7,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from app.db.base import DatabaseSettings, create_engine_and_session_factory
-from app.db.models import EncryptedCredential
+from app.db.models import EncryptedCredential, ListingModeEvidence, ScopeSnapshot
 from app.domain.enums import ListingMode, Scope
 from app.domain.scopes import ScopeSet
 from app.integrations.tiktok.client import should_retry
@@ -28,6 +29,8 @@ from app.use_cases.listing_mode import (
     assert_listing_write_allowed,
     determine_listing_mode,
 )
+from app.use_cases.product_capabilities import evaluate_product_capabilities
+from app.use_cases.products import ProductCapabilityEvidence
 from migrations.core import migrate_engine
 from shared.security import KeyRing, MasterKey, decrypt_text
 
@@ -39,6 +42,11 @@ def test_endpoint_registry_keeps_independent_versions_and_anomaly_disabled() -> 
     assert ENDPOINTS["orders.search"].path == "/order/202309/orders/search"
     assert ENDPOINTS["orders.detail"].path == "/order/202507/orders"
     assert ENDPOINTS["global.search"].version == "202312"
+    assert ENDPOINTS["global.search"].path == "/product/202312/global_products/search"
+    assert ENDPOINTS["global.full_edit"].version == "202309"
+    assert ENDPOINTS["global.full_edit"].path == (
+        "/product/202309/global_products/{global_product_id}"
+    )
     anomaly = ENDPOINTS["global.partial_edit_anomaly"]
     assert not anomaly.enabled and anomaly.official_anomaly
     with pytest.raises(PermissionError):
@@ -200,5 +208,180 @@ async def test_oauth_state_is_single_use_and_credentials_are_encrypted() -> None
                 aad=access.aad_context,
             ) == "access-plaintext"
             await session.commit()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_product_capabilities_follow_registry_scopes_credentials_and_mode() -> None:
+    settings = DatabaseSettings(url="sqlite+aiosqlite:///:memory:", path=None)
+    engine, factory = create_engine_and_session_factory(settings)
+    await migrate_engine(engine)
+    now = datetime.now(UTC)
+    key = MasterKey("v1", b"p" * 32)
+    key_ring = KeyRing.from_current(key)
+    registry = dict(ENDPOINTS)
+    registry["product.image.upload"] = replace(
+        ENDPOINTS["product.image.upload"],
+        enabled=True,
+        verified=True,
+    )
+    enabled_evidence = ProductCapabilityEvidence(registry=registry)
+    try:
+        async with factory() as session:
+            tokens = TokenSet(
+                access_token="access-token",
+                refresh_token="refresh-token",
+                open_id="capability-owner",
+                user_type=0,
+                granted_scopes=ScopeSet.parse(
+                    [Scope.PRODUCT_BASIC, Scope.PRODUCT_WRITE]
+                ),
+                access_expires_at=now + timedelta(hours=2),
+                refresh_expires_at=now + timedelta(days=30),
+            )
+            binding = await bind_authorization(
+                session,
+                tokens=tokens,
+                shops=(
+                    AuthorizedShop(
+                        "capability-shop",
+                        "shop-cipher",
+                        "MY",
+                        shop_status="ACTIVE",
+                        kyc_status="VERIFIED",
+                    ),
+                ),
+                key=key,
+                expected_scopes=[Scope.PRODUCT_BASIC, Scope.PRODUCT_WRITE],
+            )
+            session.add(
+                ListingModeEvidence(
+                    shop_binding_id=binding.id,
+                    evidence_source="OPERATOR_TARGET_ACCOUNT_CONFIRMATION",
+                    observed_value=ListingMode.LOCAL_REPLICATION.value,
+                    supports_local=True,
+                    supports_global=False,
+                    read_only_endpoint=ENDPOINTS["local.search"].path,
+                    conflict=False,
+                )
+            )
+            binding.listing_mode = ListingMode.LOCAL_REPLICATION.value
+            await session.flush()
+
+            default_blocked = await evaluate_product_capabilities(
+                session,
+                shop_binding_id=binding.id,
+                platform_configured=True,
+                key_ring=key_ring,
+                endpoint_evidence=ProductCapabilityEvidence(),
+                now=now,
+            )
+            assert default_blocked.listing_mode is ListingMode.LOCAL_REPLICATION
+            assert "BLOCKED_ENDPOINT_UNVERIFIED:product.image.upload" in default_blocked.blockers
+            assert "BLOCKED_ENDPOINT_DISABLED:product.image.upload" in default_blocked.blockers
+            assert not default_blocked.image_upload_enabled
+            assert not default_blocked.product_submission_enabled
+
+            enabled = await evaluate_product_capabilities(
+                session,
+                shop_binding_id=binding.id,
+                platform_configured=True,
+                key_ring=key_ring,
+                endpoint_evidence=enabled_evidence,
+                now=now,
+            )
+            assert enabled.image_upload_enabled
+            assert enabled.product_submission_enabled
+            assert enabled.blockers == ()
+
+            for field, blocked_value, restored_value, expected_blocker in (
+                (
+                    "authorization_status",
+                    "DEAUTHORIZED",
+                    "ACTIVE",
+                    "BLOCKED_SHOP_AUTHORIZATION",
+                ),
+                ("shop_status", "INACTIVE", "ACTIVE", "BLOCKED_SHOP_STATUS"),
+                ("kyc_status", "PENDING", "VERIFIED", "BLOCKED_KYC_STATUS"),
+            ):
+                setattr(binding, field, blocked_value)
+                await session.flush()
+                blocked = await evaluate_product_capabilities(
+                    session,
+                    shop_binding_id=binding.id,
+                    platform_configured=True,
+                    key_ring=key_ring,
+                    endpoint_evidence=enabled_evidence,
+                    now=now,
+                )
+                assert expected_blocker in blocked.blockers
+                assert not blocked.image_upload_enabled
+                assert not blocked.product_submission_enabled
+                setattr(binding, field, restored_value)
+                await session.flush()
+
+            snapshot = await session.scalar(
+                select(ScopeSnapshot)
+                .where(ScopeSnapshot.shop_binding_id == binding.id)
+                .order_by(ScopeSnapshot.captured_at.desc(), ScopeSnapshot.id.desc())
+                .limit(1)
+            )
+            assert snapshot is not None
+            snapshot.access_expires_at = now
+            await session.flush()
+            expired = await evaluate_product_capabilities(
+                session,
+                shop_binding_id=binding.id,
+                platform_configured=True,
+                key_ring=key_ring,
+                endpoint_evidence=enabled_evidence,
+                now=now,
+            )
+            assert "BLOCKED_ACCESS_TOKEN_EXPIRED" in expired.blockers
+            assert not expired.image_upload_enabled
+            assert not expired.product_submission_enabled
+            snapshot.access_expires_at = now + timedelta(hours=2)
+            await session.flush()
+
+            session.add(
+                ScopeSnapshot(
+                    shop_binding_id=binding.id,
+                    granted_scopes=[Scope.PRODUCT_BASIC.value],
+                    missing_scopes=[Scope.PRODUCT_WRITE.value],
+                    captured_at=now + timedelta(minutes=1),
+                    access_expires_at=now + timedelta(hours=2),
+                )
+            )
+            await session.flush()
+            missing_scope = await evaluate_product_capabilities(
+                session,
+                shop_binding_id=binding.id,
+                platform_configured=True,
+                key_ring=key_ring,
+                endpoint_evidence=enabled_evidence,
+                now=now,
+            )
+            assert "BLOCKED_SCOPE:seller.product.write" in missing_scope.blockers
+            assert not missing_scope.product_submission_enabled
+
+            access = await session.scalar(
+                select(EncryptedCredential).where(
+                    EncryptedCredential.credential_kind == "access_token"
+                )
+            )
+            assert access is not None
+            access.active = False
+            await session.flush()
+            missing_credential = await evaluate_product_capabilities(
+                session,
+                shop_binding_id=binding.id,
+                platform_configured=True,
+                key_ring=key_ring,
+                endpoint_evidence=enabled_evidence,
+                now=now,
+            )
+            assert "BLOCKED_ACCESS_CREDENTIAL" in missing_credential.blockers
+            assert not missing_credential.product_submission_enabled
     finally:
         await engine.dispose()

@@ -6,16 +6,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, Path, Query
+from fastapi import APIRouter, Depends, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.auth import AuthenticatedAdmin, require_admin_session, require_csrf
 from app.api.dependencies import (
     UUID_PATTERN,
+    IdempotencyKey,
     ShopBindingId,
     commerce_runtime,
     database_session,
+    session_factory,
     shop_access_context,
 )
 from app.api.errors import ERROR_RESPONSES, ApiProblem
@@ -25,6 +27,7 @@ from app.domain.product import NormalizedImage, NormalizedProduct, NormalizedSku
 from app.domain.product_payload import normalized_product_from_payload
 from app.integrations.tiktok.products import ProductGatewayError, ProductPage
 from app.use_cases.commerce_context import ShopAccessContext
+from app.use_cases.product_capabilities import evaluate_product_capabilities
 from shared.redaction import is_sensitive_key
 
 
@@ -159,8 +162,11 @@ class RemoteProductPageResponse(_StrictModel):
 class ProductCapabilitiesResponse(_StrictModel):
     platform_configured: bool
     master_key_configured: bool
+    listing_mode: str
     image_upload_enabled: bool
     product_submission_enabled: bool
+    image_upload_blockers: list[str]
+    product_submission_blockers: list[str]
     blockers: list[str]
 
 
@@ -267,24 +273,25 @@ router = APIRouter(
 async def product_capabilities(
     shop_binding_id: ShopBindingId,
     _admin: Annotated[AuthenticatedAdmin, Depends(require_admin_session)],
+    session: Annotated[AsyncSession, Depends(database_session)],
     runtime: Annotated[CommerceRuntime, Depends(commerce_runtime)],
 ) -> ProductCapabilitiesResponse:
-    del shop_binding_id
-    blockers = []
-    if not runtime.platform_configured:
-        blockers.append("BLOCKED_LIVE_CREDENTIALS")
-    if not runtime.master_key_configured:
-        blockers.append("BLOCKED_MASTER_KEY")
-    if not runtime.product_capabilities.image_upload_verified:
-        blockers.append("BLOCKED_UNVERIFIED_IMAGE_UPLOAD_ENDPOINT")
-    if not runtime.product_capabilities.live_submission_validation_verified:
-        blockers.append("BLOCKED_UNVERIFIED_LIVE_PRODUCT_VALIDATION")
-    return ProductCapabilitiesResponse(
+    decision = await evaluate_product_capabilities(
+        session,
+        shop_binding_id=shop_binding_id,
         platform_configured=runtime.platform_configured,
-        master_key_configured=runtime.master_key_configured,
-        image_upload_enabled=runtime.product_capabilities.image_upload_verified,
-        product_submission_enabled=runtime.product_capabilities.live_submission_validation_verified,
-        blockers=blockers,
+        key_ring=runtime.key_ring,
+        endpoint_evidence=runtime.product_capabilities,
+    )
+    return ProductCapabilitiesResponse(
+        platform_configured=decision.platform_configured,
+        master_key_configured=decision.master_key_configured,
+        listing_mode=decision.listing_mode.value,
+        image_upload_enabled=decision.image_upload_enabled,
+        product_submission_enabled=decision.product_submission_enabled,
+        image_upload_blockers=list(decision.image_upload_blockers),
+        product_submission_blockers=list(decision.product_submission_blockers),
+        blockers=list(decision.blockers),
     )
 
 
@@ -343,15 +350,15 @@ async def confirm_quota(
 async def submit_draft(
     shop_binding_id: ShopBindingId,
     draft_id: Annotated[str, Path(min_length=36, max_length=36, pattern=UUID_PATTERN)],
-    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=16, max_length=255)],
+    idempotency_key: IdempotencyKey,
     _admin: Annotated[AuthenticatedAdmin, Depends(require_csrf)],
-    session: Annotated[AsyncSession, Depends(database_session)],
+    factory: Annotated[async_sessionmaker[AsyncSession], Depends(session_factory)],
     context: Annotated[ShopAccessContext, Depends(shop_access_context)],
     runtime: Annotated[CommerceRuntime, Depends(commerce_runtime)],
 ) -> SubmissionResponse:
     del shop_binding_id
     result = await runtime.product_service.submit_draft(
-        session,
+        factory,
         context,
         draft_id=draft_id,
         idempotency_key=idempotency_key,

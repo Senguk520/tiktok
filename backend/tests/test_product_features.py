@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from app.db.base import DatabaseSettings, create_engine_and_session_factory
+from app.db.base import DatabaseSettings, create_engine_and_session_factory, session_scope
 from app.db.models import (
     IdempotentOperation,
     ProductDraft,
@@ -31,21 +32,25 @@ from app.domain.product_payload import (
 )
 from app.domain.scopes import ScopeSet
 from app.integrations.tiktok.endpoints import ENDPOINTS
-from app.integrations.tiktok.products import ProductSubmission, UploadedProductImage
+from app.integrations.tiktok.products import ProductPage, ProductSubmission, UploadedProductImage
 from app.repositories.catalog import ListingQuotaBlocked
 from app.use_cases.commerce_context import CommerceAccessBlocked, ShopAccessContext
 from app.use_cases.products import (
     ProductCapabilityEvidence,
     ProductService,
     ProductSubmissionBlocked,
+    ProductSubmissionInProgress,
 )
 from migrations.core import migrate_engine
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"safe-test-image"
-VERIFIED_CAPABILITIES = ProductCapabilityEvidence(
-    image_upload_verified=True,
-    live_submission_validation_verified=True,
+VERIFIED_REGISTRY = dict(ENDPOINTS)
+VERIFIED_REGISTRY["product.image.upload"] = replace(
+    ENDPOINTS["product.image.upload"],
+    enabled=True,
+    verified=True,
 )
+VERIFIED_CAPABILITIES = ProductCapabilityEvidence(registry=VERIFIED_REGISTRY)
 
 
 class FakeProductGateway:
@@ -88,6 +93,30 @@ class FakeProductGateway:
             request_id="create-request",
             raw_status="PENDING",
         )
+
+    async def search(
+        self,
+        context: ShopAccessContext,
+        *,
+        page_size: int = 20,
+        page_token: str | None = None,
+        filters: object | None = None,
+    ) -> ProductPage:
+        assert filters is None
+        return ProductPage(
+            mode=context.listing_mode,
+            items=(),
+            next_page_token=None,
+            total_count=0,
+            request_id="search-request",
+        )
+
+    async def get(
+        self,
+        _context: ShopAccessContext,
+        _product_id: str,
+    ) -> dict[str, object]:
+        raise AssertionError("unexpected product detail request")
 
 
 def product_intent() -> NormalizedProduct:
@@ -141,6 +170,151 @@ async def factory():
     return engine, session_factory
 
 
+def platform_product_intent() -> NormalizedProduct:
+    product = product_intent()
+    return replace(
+        product,
+        images=(replace(product.images[0], local_image_id="tos-image-id"),),
+    )
+
+
+async def seed_ready_submission(
+    session_factory: Any,
+    service: ProductService,
+    *,
+    mode: ListingMode,
+    identity: str,
+) -> tuple[ShopAccessContext, str]:
+    now = datetime.now(UTC)
+    async with session_scope(session_factory) as session:
+        binding = ShopBinding(
+            open_id=f"owner-{identity}",
+            shop_id=f"shop-{identity}",
+            region="MY",
+            listing_mode=mode.value,
+            authorization_status=AuthorizationStatus.ACTIVE.value,
+        )
+        session.add(binding)
+        await session.flush()
+        access = context(binding, mode)
+        if mode is ListingMode.LOCAL_REPLICATION:
+            await service.confirm_quota(
+                session,
+                access,
+                listing_limit=10,
+                locally_submitted_count=0,
+                confirmed_at=now,
+                expires_at=now + timedelta(hours=4),
+            )
+        draft = (await service.save_draft(session, access, platform_product_intent())).draft
+        await service.confirm_draft(session, access, draft.id)
+        return access, draft.id
+
+
+class RecoveryProductGateway(FakeProductGateway):
+    def __init__(self, session_factory: Any, *, scenario: str = "success") -> None:
+        super().__init__()
+        self.session_factory = session_factory
+        self.scenario = scenario
+        self.prepare_was_committed = False
+        self.search_tokens: list[str | None] = []
+        self.get_calls: list[tuple[ListingMode, str]] = []
+
+    @staticmethod
+    def _item(mode: ListingMode, product_id: str, *, seller_sku: str = "LAMP-BLACK") -> dict[str, object]:
+        id_key = "product_id" if mode is ListingMode.LOCAL_REPLICATION else "global_product_id"
+        return {id_key: product_id, "skus": [{"seller_sku": seller_sku}], "status": "PENDING"}
+
+    async def create(
+        self,
+        context: ShopAccessContext,
+        product: NormalizedProduct,
+        *,
+        reconcile: Any = None,
+    ) -> ProductSubmission:
+        async with self.session_factory() as session:
+            operation = await session.scalar(select(IdempotentOperation))
+            self.prepare_was_committed = (
+                operation is not None and operation.state == WriteState.SUBMITTED.value
+            )
+        return await super().create(context, product, reconcile=reconcile)
+
+    async def search(
+        self,
+        context: ShopAccessContext,
+        *,
+        page_size: int = 20,
+        page_token: str | None = None,
+        filters: object | None = None,
+    ) -> ProductPage:
+        assert page_size == 100
+        assert filters is None
+        self.search_tokens.append(page_token)
+        product_id = (
+            "local-product-1"
+            if context.listing_mode is ListingMode.LOCAL_REPLICATION
+            else "global-product-1"
+        )
+        if self.scenario == "zero":
+            items: tuple[dict[str, object], ...] = ()
+            next_token = None
+            total_count = 0
+        elif self.scenario == "multiple":
+            items = (
+                self._item(context.listing_mode, product_id),
+                self._item(context.listing_mode, f"{product_id}-duplicate"),
+            )
+            next_token = None
+            total_count = 2
+        elif self.scenario == "incomplete":
+            items = (self._item(context.listing_mode, product_id),)
+            next_token = f"next-{len(self.search_tokens)}"
+            total_count = 4
+        else:
+            items = (self._item(context.listing_mode, product_id),)
+            next_token = None
+            total_count = 1
+        return ProductPage(
+            mode=context.listing_mode,
+            items=items,
+            next_page_token=next_token,
+            total_count=total_count,
+            request_id="search-request",
+        )
+
+    async def get(
+        self,
+        context: ShopAccessContext,
+        product_id: str,
+    ) -> dict[str, object]:
+        self.get_calls.append((context.listing_mode, product_id))
+        seller_sku = "WRONG-SKU" if self.scenario == "detail_mismatch" else "LAMP-BLACK"
+        return self._item(context.listing_mode, product_id, seller_sku=seller_sku)
+
+
+class FailOnceCompletionProductService(ProductService):
+    def __init__(self, gateway: RecoveryProductGateway) -> None:
+        super().__init__(gateway, capabilities=VERIFIED_CAPABILITIES)
+        self.fail_next_completion = True
+
+    async def complete_draft_submission(
+        self,
+        session: Any,
+        context: ShopAccessContext,
+        prepared: Any,
+        submission: ProductSubmission,
+    ) -> Any:
+        if self.fail_next_completion:
+            self.fail_next_completion = False
+            raise RuntimeError("simulated local completion failure")
+        return await super().complete_draft_submission(
+            session,
+            context,
+            prepared,
+            submission,
+        )
+
+
 def test_normalized_product_payload_is_stable_and_strict() -> None:
     product = product_intent()
     payload = normalized_product_to_payload(product)
@@ -176,7 +350,7 @@ async def test_unverified_product_calls_fail_before_gateway() -> None:
             session.add(binding)
             await session.flush()
             access = context(binding, ListingMode.LOCAL_REPLICATION)
-            with pytest.raises(ProductSubmissionBlocked, match="image upload"):
+            with pytest.raises(ProductSubmissionBlocked, match="endpoint registry"):
                 await service.upload_draft_image(
                     session,
                     access,
@@ -186,9 +360,9 @@ async def test_unverified_product_calls_fail_before_gateway() -> None:
                     filename="main.png",
                     content_type="image/png",
                 )
-            with pytest.raises(ProductSubmissionBlocked, match="live category"):
+            with pytest.raises(ProductSubmissionBlocked, match="endpoint registry"):
                 await service.submit_draft(
-                    session,
+                    session_factory,
                     access,
                     draft_id="not-read",
                     idempotency_key="not-persisted",
@@ -243,15 +417,16 @@ async def test_local_draft_image_quota_and_submission_are_one_durable_chain() ->
             assert not uploaded.replayed
             assert uploaded.asset.tiktok_image_id == "tos-image-id"
             assert "secret" not in repr(access)
+            await session.commit()
 
             submitted = await service.submit_draft(
-                session,
+                session_factory,
                 access,
                 draft_id=saved.draft.id,
                 idempotency_key="create-lamp-1",
             )
             replayed = await service.submit_draft(
-                session,
+                session_factory,
                 access,
                 draft_id=saved.draft.id,
                 idempotency_key="create-lamp-1",
@@ -260,8 +435,10 @@ async def test_local_draft_image_quota_and_submission_are_one_durable_chain() ->
             assert replayed.replayed
             assert gateway.create_modes == [ListingMode.LOCAL_REPLICATION]
 
+            submitted_draft_id = saved.draft.id
+            session.expire_all()
             quota = await session.scalar(select(QuotaSnapshotModel))
-            draft = await session.get(ProductDraft, saved.draft.id)
+            draft = await session.get(ProductDraft, submitted_draft_id)
             link = await session.scalar(select(ProductLink))
             operation = await session.scalar(select(IdempotentOperation))
             asset = await session.scalar(select(ProductImageAsset))
@@ -302,8 +479,9 @@ async def test_global_mode_never_falls_back_to_local_or_consumes_local_quota() -
                 filename="main.png",
                 content_type="image/png",
             )
+            await session.commit()
             result = await service.submit_draft(
-                session,
+                session_factory,
                 access,
                 draft_id=draft.id,
                 idempotency_key="create-global-lamp",
@@ -336,7 +514,7 @@ async def test_unknown_mode_and_unknown_quota_fail_before_gateway_call() -> None
             unknown = context(binding, ListingMode.UNKNOWN)
             with pytest.raises(CommerceAccessBlocked, match="not verified"):
                 await service.submit_draft(
-                    session,
+                    session_factory,
                     unknown,
                     draft_id="missing",
                     idempotency_key="blocked",
@@ -354,13 +532,123 @@ async def test_unknown_mode_and_unknown_quota_fail_before_gateway_call() -> None
                 filename="main.png",
                 content_type="image/png",
             )
+            await session.commit()
             with pytest.raises(ListingQuotaBlocked, match="BLOCK_UNKNOWN"):
                 await service.submit_draft(
-                    session,
+                    session_factory,
                     local,
                     draft_id=draft.id,
                     idempotency_key="quota-blocked",
                 )
             assert gateway.create_modes == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [ListingMode.LOCAL_REPLICATION, ListingMode.GLOBAL_LEGACY],
+)
+async def test_completion_failure_recovers_without_a_second_create(mode: ListingMode) -> None:
+    engine, session_factory = await factory()
+    gateway = RecoveryProductGateway(session_factory)
+    service = FailOnceCompletionProductService(gateway)
+    try:
+        access, draft_id = await seed_ready_submission(
+            session_factory,
+            service,
+            mode=mode,
+            identity=f"recover-{mode.value.lower()}",
+        )
+        with pytest.raises(RuntimeError, match="local completion failure"):
+            await service.submit_draft(
+                session_factory,
+                access,
+                draft_id=draft_id,
+                idempotency_key=f"recover-{mode.value.lower()}",
+            )
+        assert gateway.prepare_was_committed
+        assert gateway.create_modes == [mode]
+        async with session_factory() as session:
+            operation = await session.scalar(select(IdempotentOperation))
+            assert operation is not None and operation.state == WriteState.SUBMITTED.value
+            assert await session.scalar(select(ProductLink)) is None
+
+        recovered = await service.submit_draft(
+            session_factory,
+            access,
+            draft_id=draft_id,
+            idempotency_key=f"recover-{mode.value.lower()}",
+        )
+        replayed = await service.submit_draft(
+            session_factory,
+            access,
+            draft_id=draft_id,
+            idempotency_key=f"recover-{mode.value.lower()}",
+        )
+        assert recovered.submission.mode is mode
+        assert recovered.submission.product_id.endswith("product-1")
+        assert replayed.replayed
+        assert gateway.create_modes == [mode]
+        assert gateway.search_tokens == [None]
+        assert gateway.get_calls == [(mode, recovered.submission.product_id)]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["zero", "multiple", "incomplete", "detail_mismatch"])
+async def test_non_unique_reconciliation_enters_manual_review_and_never_recreates(
+    scenario: str,
+) -> None:
+    engine, session_factory = await factory()
+    gateway = RecoveryProductGateway(session_factory)
+    service = FailOnceCompletionProductService(gateway)
+    try:
+        access, draft_id = await seed_ready_submission(
+            session_factory,
+            service,
+            mode=ListingMode.LOCAL_REPLICATION,
+            identity=f"manual-{scenario}",
+        )
+        key = f"manual-review-{scenario}"
+        with pytest.raises(RuntimeError, match="local completion failure"):
+            await service.submit_draft(
+                session_factory,
+                access,
+                draft_id=draft_id,
+                idempotency_key=key,
+            )
+        gateway.scenario = scenario
+        with pytest.raises(ProductSubmissionInProgress, match="manual review"):
+            await service.submit_draft(
+                session_factory,
+                access,
+                draft_id=draft_id,
+                idempotency_key=key,
+            )
+        upstream_counts = (
+            len(gateway.create_modes),
+            len(gateway.search_tokens),
+            len(gateway.get_calls),
+        )
+        with pytest.raises(ProductSubmissionInProgress, match="MANUAL_REVIEW"):
+            await service.submit_draft(
+                session_factory,
+                access,
+                draft_id=draft_id,
+                idempotency_key=key,
+            )
+        assert upstream_counts == (
+            len(gateway.create_modes),
+            len(gateway.search_tokens),
+            len(gateway.get_calls),
+        )
+        assert gateway.create_modes == [ListingMode.LOCAL_REPLICATION]
+        async with session_factory() as session:
+            operation = await session.scalar(select(IdempotentOperation))
+            assert operation is not None and operation.state == WriteState.MANUAL_REVIEW.value
+            assert "same-mode search" in (operation.manual_review_reason or "")
     finally:
         await engine.dispose()

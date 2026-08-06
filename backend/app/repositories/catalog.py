@@ -321,6 +321,30 @@ async def release_listing_quota(
     return result.rowcount == 1
 
 
+async def product_links_for_seller_skus(
+    session: AsyncSession,
+    *,
+    shop_binding_id: str,
+    seller_skus: tuple[str, ...],
+) -> tuple[ProductLink, ...]:
+    cleaned = tuple(dict.fromkeys(value.strip() for value in seller_skus if value.strip()))
+    if not cleaned:
+        return ()
+    rows = await session.scalars(
+        select(ProductLink)
+        .where(
+            ProductLink.shop_binding_id == shop_binding_id,
+            ProductLink.seller_sku.in_(cleaned),
+        )
+        .order_by(ProductLink.seller_sku, ProductLink.id)
+    )
+    return tuple(
+        row
+        for row in rows
+        if row.global_product_id is not None or bool(row.local_product_by_region)
+    )
+
+
 async def record_product_submission(
     session: AsyncSession,
     *,

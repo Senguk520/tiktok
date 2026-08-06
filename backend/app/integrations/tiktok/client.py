@@ -80,7 +80,7 @@ def should_retry(
     idempotency_registered: bool,
     reconciliation_available: bool,
 ) -> bool:
-    if attempt >= max_attempts or not selected.enabled:
+    if attempt >= max_attempts or not selected.enabled or not selected.verified:
         return False
     if failure.category not in {
         ErrorCategory.RATE_LIMITED,
