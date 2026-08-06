@@ -36,6 +36,7 @@ temp/
 !.env.example
 *.pem
 *.key
+docs/妙手/妙手接口文档.txt
 
 # Logs and editor/OS files
 *.log

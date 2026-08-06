@@ -19,6 +19,7 @@ export const router = createRouter({
       children: [
         { path: '', redirect: '/overview' },
         { path: 'overview', name: 'overview', component: () => import('@/views/OverviewView.vue') },
+        { path: 'miaoshou', name: 'miaoshou', component: () => import('@/views/MiaoshouView.vue') },
         { path: 'products', name: 'products', component: () => import('@/views/ProductsView.vue') },
         { path: 'orders', name: 'orders', component: () => import('@/views/OrdersView.vue') },
         { path: 'tools', name: 'tools', component: () => import('@/views/ToolsView.vue') },

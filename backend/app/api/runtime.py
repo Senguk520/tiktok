@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.integrations.miaoshou.client import (
+    MiaoshouClient,
+    MiaoshouConfig,
+    MiaoshouConfigurationError,
+    miaoshou_enabled_from_env,
+)
+from app.integrations.miaoshou.shops import MiaoshouShopAdapter
 from app.integrations.tiktok.client import TikTokClient, TikTokConfig
 from app.integrations.tiktok.orders import TikTokOrderGateway
 from app.integrations.tiktok.products import TikTokProductGateway
@@ -15,6 +22,7 @@ from app.integrations.translation import (
     TranslationProvider,
 )
 from app.use_cases.commerce_context import CommerceAccessBlocked
+from app.use_cases.miaoshou_shops import MiaoshouShopQueryService
 from app.use_cases.orders import OrderService
 from app.use_cases.products import ProductCapabilityEvidence, ProductService
 from shared.security import KeyRing, SecurityConfigurationError, load_master_key_from_env
@@ -45,6 +53,9 @@ class CommerceRuntime:
     product_capabilities: ProductCapabilityEvidence
     translation_provider: TranslationProvider | None
     translation_configured: bool
+    miaoshou_shop_service: MiaoshouShopQueryService | None = None
+    miaoshou_configured: bool = False
+    miaoshou_blocker: str = "MIAOSHOU_PROVIDER_DISABLED"
 
 
 def _build_translation_provider() -> TranslationProvider | None:
@@ -52,6 +63,16 @@ def _build_translation_provider() -> TranslationProvider | None:
         return AzureTranslator(AzureTranslatorConfig.from_env())
     except TranslationConfigurationBlocked:
         return None
+
+
+def _build_miaoshou_provider() -> tuple[MiaoshouShopQueryService | None, bool, str]:
+    try:
+        if not miaoshou_enabled_from_env():
+            return None, False, "MIAOSHOU_PROVIDER_DISABLED"
+        config = MiaoshouConfig.from_env()
+    except MiaoshouConfigurationError as exc:
+        return None, False, exc.code
+    return MiaoshouShopQueryService(MiaoshouShopAdapter(MiaoshouClient(config))), True, ""
 
 
 def build_commerce_runtime() -> CommerceRuntime:
@@ -68,6 +89,7 @@ def build_commerce_runtime() -> CommerceRuntime:
     except ValueError:
         pass
 
+    miaoshou_service, miaoshou_configured, miaoshou_blocker = _build_miaoshou_provider()
     capabilities = ProductCapabilityEvidence()
     if client is None:
         blocked = _BlockedTikTokGateway()
@@ -81,6 +103,9 @@ def build_commerce_runtime() -> CommerceRuntime:
             product_capabilities=capabilities,
             translation_provider=translation_provider,
             translation_configured=translation_provider is not None,
+            miaoshou_shop_service=miaoshou_service,
+            miaoshou_configured=miaoshou_configured,
+            miaoshou_blocker=miaoshou_blocker,
         )
 
     product_gateway = TikTokProductGateway(client)
@@ -95,4 +120,7 @@ def build_commerce_runtime() -> CommerceRuntime:
         product_capabilities=capabilities,
         translation_provider=translation_provider,
         translation_configured=translation_provider is not None,
+        miaoshou_shop_service=miaoshou_service,
+        miaoshou_configured=miaoshou_configured,
+        miaoshou_blocker=miaoshou_blocker,
     )

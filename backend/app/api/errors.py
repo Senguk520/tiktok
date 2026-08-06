@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, Response
 
 from app.domain.orders import OrderPayloadError
 from app.domain.product_payload import ProductPayloadError
+from app.integrations.miaoshou.client import MiaoshouClientError, MiaoshouFailureCategory
 from app.integrations.tiktok.client import TikTokClientError
 from app.integrations.tiktok.errors import ErrorCategory
 from app.integrations.tiktok.orders import OrderGatewayError
@@ -96,6 +97,21 @@ def _tiktok_failure(exc: TikTokClientError) -> _MappedFailure:
     return _MappedFailure(502, "TIKTOK_UPSTREAM_UNAVAILABLE", "TikTok upstream is unavailable")
 
 
+def _miaoshou_failure(exc: MiaoshouClientError) -> _MappedFailure:
+    category = exc.failure.category
+    if category is MiaoshouFailureCategory.AUTHORIZATION:
+        return _MappedFailure(502, "MIAOSHOU_AUTHORIZATION_BLOCKED", "Miaoshou authorization was rejected")
+    if category is MiaoshouFailureCategory.PERMISSION:
+        return _MappedFailure(403, "MIAOSHOU_PERMISSION_BLOCKED", "Miaoshou endpoint permission is missing")
+    if category is MiaoshouFailureCategory.RATE_LIMITED:
+        return _MappedFailure(429, "MIAOSHOU_RATE_LIMITED", "Miaoshou rate limited the operation")
+    if category is MiaoshouFailureCategory.VALIDATION:
+        return _MappedFailure(422, "MIAOSHOU_REQUEST_REJECTED", "Miaoshou rejected the request")
+    if category is MiaoshouFailureCategory.INVALID_RESPONSE:
+        return _MappedFailure(502, "MIAOSHOU_RESPONSE_INVALID", "Miaoshou returned an invalid response")
+    return _MappedFailure(502, "MIAOSHOU_UPSTREAM_UNAVAILABLE", "Miaoshou upstream is unavailable")
+
+
 def _map_exception(exc: Exception) -> _MappedFailure:
     if isinstance(exc, ApiProblem):
         return _MappedFailure(exc.status_code, exc.code, exc.safe_message)
@@ -109,6 +125,8 @@ def _map_exception(exc: Exception) -> _MappedFailure:
         return _MappedFailure(exc.status_code, "REQUEST_REJECTED", "request was rejected")
     if isinstance(exc, TikTokClientError):
         return _tiktok_failure(exc)
+    if isinstance(exc, MiaoshouClientError):
+        return _miaoshou_failure(exc)
     if isinstance(exc, DraftNotFound):
         return _MappedFailure(404, "DRAFT_NOT_FOUND", "product draft was not found")
     if isinstance(exc, (DraftConflict, IdempotencyConflict, ProductSubmissionInProgress, IntegrityError)):

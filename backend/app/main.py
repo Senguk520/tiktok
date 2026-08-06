@@ -21,6 +21,7 @@ from app.api.auth import router as session_router
 from app.api.errors import install_api_errors
 from app.api.routes.audits import router as audits_router
 from app.api.routes.collector import router as collector_router
+from app.api.routes.miaoshou import router as miaoshou_router
 from app.api.routes.orders import router as orders_router
 from app.api.routes.products import router as products_router
 from app.api.routes.schedules import router as schedules_router
@@ -118,6 +119,7 @@ def create_app() -> FastAPI:
     application.include_router(shops_router)
     application.include_router(products_router)
     application.include_router(orders_router)
+    application.include_router(miaoshou_router)
     application.include_router(tools_router)
     application.include_router(schedules_router)
     application.include_router(audits_router)

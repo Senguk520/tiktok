@@ -51,6 +51,37 @@ export interface ShopSummary {
   order_read_blockers: string[]
 }
 
+export interface MiaoshouCapabilities {
+  provider: 'miaoshou'
+  configured: boolean
+  shop_query_enabled: boolean
+  blockers: string[]
+}
+
+export interface MiaoshouShop {
+  shop_id: string
+  shop_name: string | null
+  platform: string
+  site: string
+  site_name: string | null
+  status: string | null
+  authorization_expires_at: string | null
+  last_authorized_at: string | null
+  parent_shop_id: string | null
+  is_cross_border: boolean | null
+  is_global: boolean | null
+}
+
+export interface MiaoshouShopPage {
+  provider: 'miaoshou'
+  platform: string
+  site: string
+  page_no: number
+  page_size: number
+  next_page_no: number | null
+  items: MiaoshouShop[]
+}
+
 export interface ProductCapabilities {
   platform_configured: boolean
   master_key_configured: boolean
@@ -323,6 +354,23 @@ export const coreApi = {
 
   shops: async (): Promise<ShopSummary[]> =>
     (await apiRequest<{ items: ShopSummary[] }>('/api/shops')).items,
+
+  miaoshouCapabilities: (): Promise<MiaoshouCapabilities> =>
+    apiRequest<MiaoshouCapabilities>('/api/miaoshou/capabilities'),
+  miaoshouShops: (
+    platform: 'tiktok' | 'tiktokGlobal',
+    site: string,
+    pageNo = 1,
+    pageSize = 100,
+  ): Promise<MiaoshouShopPage> => {
+    const query = new URLSearchParams({
+      platform,
+      site,
+      page_no: String(pageNo),
+      page_size: String(pageSize),
+    })
+    return apiRequest<MiaoshouShopPage>(`/api/miaoshou/shops?${query.toString()}`)
+  },
 
   productCapabilities: (shopBindingId: string): Promise<ProductCapabilities> =>
     apiRequest<ProductCapabilities>(`${shopBase(shopBindingId)}/products/capabilities`),

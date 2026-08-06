@@ -1,8 +1,8 @@
 # TikTok 单店管理系统阶段进度复核
 
-> 复核日期：2026-08-06
-> 复核范围：当前工作树中的六项指定问题。
-> 证据口径：以当前源码、当前未提交差异及现有测试代码为准；本轮只读核实未执行测试、类型检查或构建，因此“测试代码存在”不等于“本轮已验证通过”。
+> 初始复核日期：2026-08-06
+> 初始复核范围：当时工作树中的六项指定问题。
+> 初始证据口径：下列六项保留当时的只读核实结论；文末“妙手平台只读接入里程碑”另行记录后续实际执行的测试、构建与联调状态，二者不得混读。
 
 ## 复核结论
 
@@ -162,10 +162,45 @@
 
 ## 下一验证门槛
 
-在将上述结论更新为“已执行验证”前，需要继续使用项目虚拟环境完成：
+在将上述六项初始复核结论更新为“已执行验证”前，仍需分别补齐对应专项证据；本次妙手里程碑的验证结果不替代这些缺口：
 
-1. 后端完整 `pytest` 与 Ruff；
-2. 前端 Session 专项测试、TypeScript 类型检查及构建；
-3. Collector 图片路由无签名负向测试；
-4. 订单不完整详情不得误清空已有订单行的回归测试；
-5. 真实凭据相关链路继续保持 `BLOCKED_LIVE_CREDENTIALS`，不得以 Mock 结果替代。
+1. 前端 Session 专项测试；
+2. Collector 图片路由无签名负向测试；
+3. 订单不完整详情不得误清空已有订单行的回归测试；
+4. TikTok、采集与翻译真实凭据链路继续保持 `BLOCKED_LIVE_CREDENTIALS`，不得以 Mock 结果替代。
+
+## 妙手平台只读接入里程碑（阶段更新）
+
+### 实现范围与边界
+
+- 新增可选的妙手 JCOP Provider，仅接入授权店铺列表 `POST /open/v1/product/shop/shop/get_shop_list`。
+- Core API 新增管理员会话保护的 `GET /api/miaoshou/capabilities` 与 `GET /api/miaoshou/shops`；前端新增“妙手店铺”页面，支持 TikTok/TikTok Global、站点筛选和分页。
+- 本阶段只读查询，不写 SQLite、不建立进程缓存、不回退到演示数据，也不替换 TikTok 官方 API 主链路。
+- 采集箱编辑、认领、发布及任何真实店铺写操作不属于本阶段，继续失败关闭。
+
+### 配置与安全边界
+
+- Provider 默认关闭。启用需要显式设置 `MIAOSHOU_ENABLED=true`，并通过环境变量提供 `MIAOSHOU_APP_KEY`、`MIAOSHOU_APP_SECRET`；`MIAOSHOU_BASE_URL` 必须为无用户信息、查询串和片段的 HTTPS 地址，超时由 `MIAOSHOU_TIMEOUT_SECONDS` 控制。
+- `.env.example` 仅包含空占位符和公开基址，没有真实凭据。
+- 上游错误只映射为稳定错误类别；响应和异常不返回 App Secret、签名或原始上游正文。
+- 本地 `docs/妙手/妙手接口文档.txt` 继续视为敏感材料，已加入 `.gitignore`；不复制到源码、测试、环境模板或本文。
+
+### 已执行验证
+
+- 后端全量 Ruff：`cd backend && .\.venv\Scripts\python.exe -m ruff check .`，结果 `All checks passed!`。
+- 妙手及关键 API/平台/安全回归：`cd backend && .\.venv\Scripts\python.exe -m pytest -q tests/test_miaoshou.py tests/test_api_routes.py tests/test_tiktok_platform.py tests/test_security.py`，结果 `27 passed, 1 warning`。
+- 后端完整测试：`cd backend && .\.venv\Scripts\python.exe -m pytest -q`，结果 `152 passed, 1 skipped, 1 warning`；跳过项是当前 Windows 账户缺少创建符号链接权限，warning 是测试依赖的既有弃用提示。
+- 前端类型检查：`cd frontend && npm run typecheck`，通过。
+- 前端测试：`cd frontend && npm test`，结果 `4 passed` 个测试文件、`6 passed` 个测试。
+- 前端生产构建：`cd frontend && npm run build`，通过；保留既有的主包超过 500 kB 警告。
+- 妙手专项离线测试覆盖签名确定性、配置失败关闭、HTTPS 基址限制、上游错误脱敏、店铺字段规范化、未登录拒绝、Provider 未启用阻断及受控 transport 下只读返回。
+
+### 真实联调状态
+
+- **未执行真实 Shop Query，不计为通过。** 当前进程中 `MIAOSHOU_ENABLED`、`MIAOSHOU_APP_KEY`、`MIAOSHOU_APP_SECRET`、`MIAOSHOU_BASE_URL` 均未设置，仓库中也没有本地 `resources/config.json` 凭据文件。
+- 在线 Apifox 文档当前需要密码，无法独立复核官方鉴权契约；本阶段实现依据仅为本地接口材料、Skill reference 和脚本的一致描述。
+- 因缺少显式环境凭据且官方在线契约不可独立核验，未从敏感文档自动提取或尝试任何凭据，也未向真实上游发起请求。精确阻塞为 `MIAOSHOU_PROVIDER_DISABLED`；即使只打开开关，缺少凭据仍会转为 `BLOCKED_LIVE_CREDENTIALS`。
+
+### 计划状态说明
+
+计划文件 YAML 中八项 todo 仍保持 `pending`：它们是全项目验收项，本次可选只读 Provider 里程碑没有完成任一整项，故不将局部实现虚报为项目级完成。

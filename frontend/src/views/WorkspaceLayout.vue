@@ -17,11 +17,12 @@ const mobileNavigation = ref(false)
 
 const navigation = [
   { path: '/overview', label: '总览', mark: '01' },
-  { path: '/products', label: '商品', mark: '02' },
-  { path: '/orders', label: '订单', mark: '03' },
-  { path: '/tools', label: '运营工具', mark: '04' },
-  { path: '/schedules', label: '自动调度', mark: '05' },
-  { path: '/audits', label: '审计记录', mark: '06' },
+  { path: '/miaoshou', label: '妙手店铺', mark: '02' },
+  { path: '/products', label: '商品', mark: '03' },
+  { path: '/orders', label: '订单', mark: '04' },
+  { path: '/tools', label: '运营工具', mark: '05' },
+  { path: '/schedules', label: '自动调度', mark: '06' },
+  { path: '/audits', label: '审计记录', mark: '07' },
 ]
 
 const activePath = computed(() => route.path)
