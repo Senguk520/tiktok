@@ -1,0 +1,4 @@
+interface:
+  display_name: "Miaoshou ERP Shop Query"
+  short_description: "Query complete authorized-shop lists by platform and site."
+  default_prompt: "Use $miaoshou-erp-shop-query to query authorized shops for a platform and site and return usable shop IDs."

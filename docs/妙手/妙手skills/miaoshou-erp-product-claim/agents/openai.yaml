@@ -1,0 +1,4 @@
+interface:
+  display_name: "Miaoshou ERP Product Claim"
+  short_description: "Claim common collect box products to platform collect boxes."
+  default_prompt: "把公共采集箱商品认领到指定平台采集箱，并返回公共商品 ID 到平台采集箱 ID 的映射。"
