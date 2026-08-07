@@ -329,3 +329,73 @@
 - 目标静态检查：`Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m ruff check --no-cache app/repositories/orders.py tests/test_order_features.py` → `All checks passed!`。
 - 本次只使用现有内存 SQLite；未运行缓存类测试、固定磁盘清理、后端全量 pytest 或真实网络。`git diff --check` 通过，仅有既有 LF→CRLF 提示；修复文件替换字符扫描无命中。P0-B 主计划完成状态保持不变，下一步仍为 P0-C。
 - 提交前父级合并复跑：`Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q tests/test_order_features.py tests/test_value_tools.py::test_translation_http_e2e_succeeds_with_controlled_azure_transport tests/test_value_tools.py::test_translation_http_e2e_fails_closed_without_upstream_leakage` → `12 passed, 1 warning in 1.88s`；cacheprovider 已禁用，warning 仍为既有 TestClient 弃用提示。
+
+## P0-C 实际执行更新（2026-08-07）
+
+### 状态
+
+**P0-C：配置与证据基线已完成（静态配置核对 + 脱敏阻塞证据）。** 进程环境未显式启用妙手 Provider，因此没有执行真实网络请求；可提交产物稳定记录 `MIAOSHOU_PROVIDER_DISABLED`。这满足 P0-C 的“可操作阻塞”口径，但不代表妙手真实只读验收通过。由于缓存类测试、后端完整 pytest、前端完整 build 等 P0 总门槛未执行，主计划 `p0-trustworthy-baseline` 继续保持 `in_progress`。
+
+### 实际修改文件
+
+- `.env.example`：按九组重建 29 个运行时变量；所有 Secret/Token/Key/Bootstrap 值为空，仅保留源码公开安全默认值和仓库相对 SQLite 路径。
+- `backend/pyproject.toml`：把最小 `live_checks` 包加入打包发现与 pyright 检查范围。
+- `backend/live_checks/report.py`：定义严格 10 字段报告、稳定状态/notes、短 SHA-256 资源指纹与安全 JSON 序列化。
+- `backend/live_checks/miaoshou.py`：仅在显式启用且凭据齐全时，复用现有 Client/Adapter/Query Service 读取 `platform=tiktok`、`site=MY` 的店铺列表；只映射稳定结果或阻塞类别。
+- `backend/live_checks/writer.py`：随机同目录临时文件写入、flush/fsync 后，以 `os.replace` 原子替换一个指定 JSON 文件；不创建或删除目录。
+- `backend/live_checks/__main__.py`、`backend/live_checks/__init__.py`：提供最小 runner 和公开报告类型，不加载仓库 `.env`。
+- `backend/tests/test_live_checks.py`：12 个纯离线安全回归，覆盖字段 allowlist、不可逆短指纹、敏感字段拒绝、阻塞稳定、唯一只读查询和 `tmp_path` 单文件写出。
+- `docs/live-checks/miaoshou-shop-list-my.json`：本次脱敏阻塞产物，仅含允许字段。
+- `docs/tiktok_单店管理系统_84523573.plan.md`、`docs/remember.md`、`docs/progress-review-2026-08-06.md`：同步 P0-C 实际状态、边界和下一步。
+
+### 变量分组与静态核对
+
+- 数据库/路径：`DATABASE_URL`、`CORE_DATABASE_PATH`、`COLLECTOR_DATABASE_PATH`、`SQL_ECHO`。
+- 管理员 Session：`ADMIN_BOOTSTRAP_SECRET`、`ADMIN_SESSION_TTL_SECONDS`、`ADMIN_SESSION_COOKIE_SECURE`。
+- 应用加密/内部 HMAC：`APP_MASTER_KEY`、`COLLECTOR_INTERNAL_HMAC_SECRET`。
+- CORS/host：`FRONTEND_ORIGINS`、`SERVICE_ALLOWED_HOSTS`；loopback 开关没有环境读取点。
+- TikTok：`TIKTOK_SERVICE_ID`、`TIKTOK_APP_KEY`、`TIKTOK_APP_SECRET`、`TIKTOK_API_BASE_URL`。
+- Collector 来源：`CJ_ACCESS_TOKEN`、`ALIBABA_1688_APP_KEY`、`ALIBABA_1688_APP_SECRET`、`ALIBABA_1688_ACCESS_TOKEN`。
+- Azure Translator：`AZURE_TRANSLATOR_KEY`、`AZURE_TRANSLATOR_REGION`、`AZURE_TRANSLATOR_ENDPOINT`、`AZURE_TRANSLATOR_TIMEOUT_SECONDS`。
+- 妙手：`MIAOSHOU_ENABLED`、`MIAOSHOU_APP_KEY`、`MIAOSHOU_APP_SECRET`、`MIAOSHOU_BASE_URL`、`MIAOSHOU_TIMEOUT_SECONDS`。
+- 前端：`VITE_CORE_API_URL`；Vite 默认从 `frontend/.env` 读取，根模板只作为中央安全参考。
+- 静态集合比较结果：`RUNTIME_ENV_COUNT=29 TEMPLATE_ENV_COUNT=29 MISSING=[] EXTRA=[]`。
+- 未新增源码不存在的 worker/scheduler 开关。已记录技术债：Core→Collector 基址、Core/Collector worker lease/batch/poll delay、TikTok OAuth URL/Token URL、TikTok/Collector timeout 和 loopback 行为仍硬编码。
+
+### 妙手进程环境与 live 状态
+
+- 布尔检查结果：`MIAOSHOU_ENABLED` 不存在且未启用；`MIAOSHOU_APP_KEY`、`MIAOSHOU_APP_SECRET`、`MIAOSHOU_BASE_URL` 均不存在。命令只输出布尔，未读取 `.env`，也未输出值、长度、前后缀或 repr。
+- runner 结果：`status=BLOCKED`、`site=MY`、`error_category=MIAOSHOU_PROVIDER_DISABLED`、`shop_count=0`。
+- 未进入 Provider 网络路径；未执行任何真实写接口，也未把历史聊天中的成功报告当作本次验收。
+
+### 已执行命令与结果
+
+- 进程环境布尔检查：`& 'H:\tiktok\backend\.venv\Scripts\python.exe' -B -c "import json, os; raw=os.environ.get('MIAOSHOU_ENABLED'); print(json.dumps({'MIAOSHOU_ENABLED_PRESENT': raw is not None, 'MIAOSHOU_ENABLED_TRUE': isinstance(raw, str) and raw.strip().lower() == 'true', 'MIAOSHOU_APP_KEY_PRESENT': bool(os.environ.get('MIAOSHOU_APP_KEY','').strip()), 'MIAOSHOU_APP_SECRET_PRESENT': bool(os.environ.get('MIAOSHOU_APP_SECRET','').strip()), 'MIAOSHOU_BASE_URL_PRESENT': bool(os.environ.get('MIAOSHOU_BASE_URL','').strip())}, sort_keys=True))"` → 五项均为 `false`。
+- 变量集合比较：使用仓库 Python `-B -c` 读取明确列出的已提交设置文件及 `.env.example` 键集合 → `RUNTIME_ENV_COUNT=29 TEMPLATE_ENV_COUNT=29 MISSING=[] EXTRA=[]`。
+- `Set-Location 'H:\tiktok\backend'; $env:PYTHONDONTWRITEBYTECODE='1'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -B -m live_checks` → `MIAOSHOU_PROVIDER_DISABLED`，原子写出阻塞产物。
+- 首次 `ruff check --no-cache live_checks tests/test_live_checks.py` → 发现 1 个未使用 import、1 个 import 排序问题；手工修正后 `& 'H:\tiktok\backend\.venv\Scripts\python.exe' -B -m ruff check --no-cache live_checks tests/test_live_checks.py` → `All checks passed!`。
+- `Set-Location 'H:\tiktok\backend'; $env:PYTHONDONTWRITEBYTECODE='1'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -B -m pytest -p no:cacheprovider -q tests/test_live_checks.py` → 多次复跑均为 `12 passed`；最终一轮 `12 passed in 0.22s`。
+- 产物反序列化校验 → `ARTIFACT_VALID=true FIELD_COUNT=10 STATUS=BLOCKED ERROR_CATEGORY=MIAOSHOU_PROVIDER_DISABLED`。
+- `.env.example` 安全值校验 → `ENV_ENTRIES=29 SECRET_PLACEHOLDERS_EMPTY=true DEFAULTS_ALLOWLISTED=true`。
+- `backend/pyproject.toml` TOML/包范围校验 → `LIVE_CHECKS_PACKAGED=true`。
+- 对 12 个显式本任务文件执行 UTF-8 严格解码、替换字符、行尾空白和常见长凭据模式扫描 → `SAFETY_FILE_COUNT=12 ISSUE_COUNT=0 ISSUES=[]`；扫描列表不含两个 BYOK 文件。
+- `Set-Location 'H:\tiktok'; git diff --check` → 通过，仅有 `.env.example`、`backend/pyproject.toml` 和两份文档的 LF→CRLF 工作副本提示；新增未跟踪任务文件由上述显式扫描覆盖。
+
+### 未执行项、风险与下一步
+
+- 未执行真实妙手请求，因为进程环境没有显式启用 Provider；没有读取根 `.env`、被 Git 忽略的妙手接口资料、`docs/妙手`、凭据文件或无关 BYOK 文件。
+- 未运行任何缓存功能/缓存类测试、pytest cache、npm cache、后端完整 pytest、前端全量 test/typecheck/build、构建缓存、目录清理、递归删除或固定磁盘临时文件；本节只声明精确窄测结果。
+- 短资源指纹用于仓库内脱敏关联，不应被当作授权标识或外部稳定 ID；真实妙手读验收仍需在未来由显式进程环境触发同一只读 runner。
+- 最近下一步为 **P0 安全质量门槛收口/评估**：逐项判断剩余完整测试与前端门槛能否在当前安全约束下执行；不能安全执行的门槛继续保持未完成，不直接跳入 P1。
+- 提交前父级复跑：`Set-Location 'H:\tiktok\backend'; $env:PYTHONDONTWRITEBYTECODE='1'; .\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider -q tests/test_live_checks.py` → `14 passed in 0.19s`；目标 Ruff `-B -m ruff check --no-cache live_checks tests/test_live_checks.py` → `All checks passed!`。本次未执行 runner、未改写产物或调用网络。
+
+### P0-C 父级审阅回归封口（2026-08-07）
+
+- 父级审阅确认首版存在验收漏洞：请求虽然固定为 TikTok/MY，但上游归一化结果未再次校验作用域；若响应保留其他平台或站点，报告可能仍用固定作用域生成成功指纹并误报通过。
+- 修复后，所有归一化店铺必须逐项精确属于 `platform=tiktok`、`site=MY`，才可进入成功计数与指纹生成；任一越界项不静默过滤，整次检查稳定返回 `FAILED / INVALID_RESPONSE`、`shop_count=0`、空指纹。
+- 离线回归分别覆盖其他 platform 与其他 site，并保留唯一只读路径和请求参数断言；成功多项场景同时证明重复身份去重后 `shop_count`、指纹数量与唯一指纹数量一致。
+- 目标静态检查：`Set-Location 'H:\tiktok\backend'; & '.\.venv\Scripts\python.exe' -B -m ruff check --no-cache live_checks/miaoshou.py tests/test_live_checks.py` → `All checks passed!`。
+- 完整 live-check 离线文件：`Set-Location 'H:\tiktok\backend'; $env:PYTHONDONTWRITEBYTECODE='1'; & '.\.venv\Scripts\python.exe' -B -m pytest -p no:cacheprovider -q tests/test_live_checks.py` → `14 passed in 0.22s`。
+- 修复后只检查 `MIAOSHOU_ENABLED` 是否为 true，结果为 `false`；随后以仓库虚拟环境和 `-B` 重生成证据，runner 返回 `MIAOSHOU_PROVIDER_DISABLED`。严格反序列化得到 `BLOCKED / MIAOSHOU_PROVIDER_DISABLED / shop_count=0 / fingerprint_count=0`，未进入真实网络路径。
+- 12 个显式 P0-C 文件的 UTF-8、替换字符、行尾空白与定向凭据模式扫描结果为 `ISSUE_COUNT=0`；`git diff --check` 通过，仅保留既有 LF→CRLF 提示。工作区仍只有 12 个 P0-C 文件和两个既有无关 BYOK 未跟踪文件，后两者未读取、修改、暂存或删除。
+- Provider 边界全部由测试替身截断，没有真实网络、真实凭据、缓存类测试、目录清理或 Git commit。主计划 P0-C 完成状态保持，`p0-trustworthy-baseline` 仍为 `in_progress`。
