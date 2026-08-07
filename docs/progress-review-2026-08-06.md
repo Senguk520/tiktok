@@ -281,3 +281,51 @@
 - P0-A 未覆盖的 P0-B 风险仍包括不完整订单详情误清空订单行、翻译成功 HTTP E2E 与 `ToolsView` 交互；下一步按计划进入 P0-B，再在安全范围内决定全量门槛执行。
 - `Set-Location 'H:\tiktok'; npm test`（以及同目录的首次 Session 命令）因仓库根目录没有 `package.json` 返回 `ENOENT`；随后显式切换到 `H:\tiktok\frontend` 重跑，结果如上，未把该失败计入测试通过数。
 - 最终精确复跑：`Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m pytest -q tests/test_collector_http_boundary.py::test_unsigned_image_route_is_rejected_before_lookup` → `1 passed, 1 warning`。
+
+## P0-B 实际执行更新（2026-08-07）
+
+### 状态
+
+**P0-B：订单与工具一致性已完成（离线/窄范围验证）。** 订单行 presence 三态、翻译成功/失败 HTTP 边界与 `ToolsView` 成功/失败交互均已有回归证据；这不代表真实 Azure 或真实 TikTok 验收。主计划 frontmatter 中 `p0-trustworthy-baseline` 继续保持 `in_progress`，最近下一步推进到 P0-C。
+
+### 实际修改文件与语义
+
+- `backend/app/domain/orders.py`：`NormalizedOrder` 新增显式 `lines_present`；规范化时分别识别 `line_items/items` 缺失、存在空数组、存在非空数组，并将 presence 纳入 PII-free 哈希载荷。非空 `lines` 若未声明 presence 会被领域校验拒绝。
+- `backend/app/repositories/orders.py`：Repository 结合明确调用上下文与领域 presence 执行：详情缺字段时保留，详情字段存在时替换（空数组可清空）；列表非空行可更新，列表显式空数组不得删除已有详情。`detail` 同时记录详情同步时间。
+- `backend/tests/test_order_features.py`：覆盖原始 payload → 领域对象 → SQLite 的四项回归：详情缺字段保留、详情明确空列表清空、正常列表替换，以及“列表显式空数组后详情缺字段”仍保留完整行；现有正常详情写入继续覆盖。
+- `backend/tests/test_api_routes.py`：测试领域样例显式声明订单行 presence，与强化后的领域约束一致。
+- `backend/tests/test_value_tools.py`：新增 Azure 配置成功/失败的离线 HTTP E2E；成功链穿过管理员 Session、CSRF、幂等登记、路由、真实 Azure Provider 适配器（`httpx.MockTransport`）、状态落库和审计，失败链验证稳定 502 与正文/密钥不泄露。API 数据库夹具改为 pytest `tmp_path` 测试 lifespan，移除项目数据目录下 UUID 临时文件和手动 unlink。
+- `frontend/tests/tools-view.test.ts`：新增组件交互测试，以 `coreApi` 窄 spy 覆盖多行文本提交、成功结果/Provider Request ID 展示，以及失败错误码/请求 ID 提示；不建立 Mock Server，不持久化数据。
+- `docs/remember.md`：按 P0-B-1/2/3 及收口验证记录可接续事实和精确结果。
+- `docs/tiktok_单店管理系统_84523573.plan.md`：标记 P0-B 完成、关闭订单/工具风险，最近下一步推进到 P0-C；聚合 P0 状态仍为 `in_progress`。
+- `docs/progress-review-2026-08-06.md`：追加本节实际执行记录。
+
+### 精确命令与结果
+
+- `Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m pytest -p no:cacheprovider -q tests/test_order_features.py::test_order_update_without_line_field_preserves_stored_lines tests/test_order_features.py::test_order_update_with_explicit_empty_lines_clears_stored_lines tests/test_order_features.py::test_order_update_with_present_lines_replaces_stored_lines` → `3 passed in 0.81s`。
+- `Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m pytest -p no:cacheprovider -q tests/test_order_features.py` → `9 passed in 1.05s`。
+- 翻译精确节点首次执行 → `2 errors, 1 warning`；原因是生产安全路径解析器拒绝项目外的 pytest `tmp_path`。改用测试 lifespan 直接装配 `tmp_path` SQLite 后复跑同一命令 → `2 passed, 1 warning in 1.67s`。首次失败未进入 Provider 调用，没有真实网络或手动清理。
+- `Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m pytest -p no:cacheprovider -q tests/test_value_tools.py -k "not test_azure_translator_uses_verified_v3_contract_without_caching"` → `14 passed, 1 deselected, 1 warning in 1.85s`；唯一 deselected 为本轮明确禁止的缓存类测试。
+- `Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m ruff check --no-cache app/domain/orders.py app/repositories/orders.py tests/test_order_features.py tests/test_value_tools.py tests/test_api_routes.py` → `All checks passed!`。
+- `Set-Location 'H:\tiktok\frontend'; npm test -- --run tests/tools-view.test.ts` → 首次 `1 file / 2 tests passed`（`2.67s`）；类型修正后复跑仍为 `1 file / 2 tests passed`（`2.40s`）。
+- `Set-Location 'H:\tiktok\frontend'; npm run typecheck` → 首次发现新测试 3 个类型错误；修正 `ShopSummary` 测试数据和 `ElMessage` mock 返回类型后复跑通过。
+- `Set-Location 'H:\tiktok'; git diff --check -- <P0-B 文件>` → 通过，仅有 LF→CRLF 转换提示；任务文件 UTF-8 替换字符和常见长凭据模式扫描无命中。
+
+### 未执行项、风险与下一步
+
+- 未运行后端全量 pytest、前端全量 Vitest、前端 build，也未运行缓存类测试；`backend/tests/test_api_routes.py` 的 HTTP 节点未执行，因为其既有共享 fixture 仍包含项目数据目录临时文件和手动 SQLite/WAL/SHM 清理，与本轮约束冲突。不能把本轮表述为全量质量门槛通过。
+- 所有 pytest 命令均显式禁用 cacheprovider；数据库只使用内存 SQLite 或 pytest `tmp_path`。没有固定盘符临时文件、目录清理、递归删除、真实网络或真实平台调用。
+- 已知 warning 为既有 Starlette/httpx TestClient 弃用提示；未升级依赖。真实 Azure 成功链和真实 TikTok 订单部分响应仍待显式 live 验收，本轮 MockTransport 只证明离线边界一致性。
+- 两个既有无关 BYOK 未跟踪文件保持未读取、未修改、未暂存、未删除。
+- 下一步执行 P0-C：补齐完整但无真实值的环境模板，并为妙手只读 Shop Query 生成可复核脱敏证据或明确记录阻塞。
+
+### P0-B 父级审阅回归封口（2026-08-07）
+
+- 父级审阅确认首版 P0-B 存在回归：Repository 只要看到 `lines_present=True` 就替换订单行，导致 `detail=False` 的列表显式空数组错误清除已存完整详情；后续缺字段详情无法恢复这些行。
+- 修复后语义为：`detail=True` 时缺字段保留、字段存在时替换或清空；`detail=False` 时非空行可更新、显式空行必须保留。Repository 只消费领域 presence、规范化行与明确调用上下文，没有接收原始平台 DTO。
+- 新增专项顺序回归：先保存完整详情，再写入列表显式空 `items`，最后写入缺行字段的详情；最终状态更新到 `SHIPPED`，但原有行、数量均保持不变。
+- 精确四节点：`Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m pytest -p no:cacheprovider -q tests/test_order_features.py::test_order_update_without_line_field_preserves_stored_lines tests/test_order_features.py::test_order_list_empty_then_missing_detail_preserves_stored_lines tests/test_order_features.py::test_order_update_with_explicit_empty_lines_clears_stored_lines tests/test_order_features.py::test_order_update_with_present_lines_replaces_stored_lines` → `4 passed in 1.41s`。
+- 完整订单文件：`Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m pytest -p no:cacheprovider -q tests/test_order_features.py` → `10 passed in 1.65s`。
+- 目标静态检查：`Set-Location 'H:\tiktok\backend'; & 'H:\tiktok\backend\.venv\Scripts\python.exe' -m ruff check --no-cache app/repositories/orders.py tests/test_order_features.py` → `All checks passed!`。
+- 本次只使用现有内存 SQLite；未运行缓存类测试、固定磁盘清理、后端全量 pytest 或真实网络。`git diff --check` 通过，仅有既有 LF→CRLF 提示；修复文件替换字符扫描无命中。P0-B 主计划完成状态保持不变，下一步仍为 P0-C。
+- 提交前父级合并复跑：`Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q tests/test_order_features.py tests/test_value_tools.py::test_translation_http_e2e_succeeds_with_controlled_azure_transport tests/test_value_tools.py::test_translation_http_e2e_fails_closed_without_upstream_leakage` → `12 passed, 1 warning in 1.88s`；cacheprovider 已禁用，warning 仍为既有 TestClient 弃用提示。

@@ -532,6 +532,7 @@ def test_order_contract_uses_only_pii_minimized_domain_facts(
                                 quantity=2,
                             ),
                         ),
+                        lines_present=True,
                     ),
                 ),
                 next_page_token=None,

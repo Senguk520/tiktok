@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from app.db.models import AuditLog, ShopBinding
-from app.domain.enums import AuthorizationStatus
+from app.api.auth import AdminAuthSettings
+from app.api.runtime import build_commerce_runtime
+from app.db.base import DatabaseSettings, create_engine_and_session_factory, dispose_engine
+from app.db.models import AuditLog, IdempotentOperation, ShopBinding
+from app.domain.enums import AuthorizationStatus, WriteState
 from app.integrations.translation import (
     AzureTranslator,
     AzureTranslatorConfig,
@@ -30,7 +35,7 @@ from app.use_cases.profit import (
     estimate_profit,
     profit_for_price,
 )
-from shared.safe_paths import PROJECT_ROOT
+from migrations.core import migrate_engine
 
 _ADMIN_SECRET = "value-tools-admin-secret-with-32-characters"
 _SHOP_ID = "11111111-1111-4111-8111-111111111111"
@@ -190,9 +195,11 @@ def test_audit_allowlist_rejects_secrets_pii_and_local_paths() -> None:
 
 
 @pytest.fixture
-def value_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[TestClient, object]]:
-    database_path = PROJECT_ROOT / "data" / f"test-value-api-{uuid4()}.sqlite3"
-    monkeypatch.setenv("CORE_DATABASE_PATH", str(database_path))
+def value_api(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterator[tuple[TestClient, FastAPI]]:
+    database_path = tmp_path / "value-api.sqlite3"
     monkeypatch.setenv("ADMIN_BOOTSTRAP_SECRET", _ADMIN_SECRET)
     monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "false")
     for key in (
@@ -203,28 +210,44 @@ def value_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[TestClient, obj
         "AZURE_TRANSLATOR_REGION",
     ):
         monkeypatch.delenv(key, raising=False)
-    app = create_app()
-    try:
-        with TestClient(app, raise_server_exceptions=False) as client:
-            async def seed() -> None:
-                async with app.state.db_session_factory.begin() as session:
-                    session.add(
-                        ShopBinding(
-                            id=_SHOP_ID,
-                            open_id="owner-1",
-                            shop_id="shop-1",
-                            region="MY",
-                            authorization_status=AuthorizationStatus.ACTIVE.value,
-                        )
-                    )
 
-            asyncio.run(seed())
-            yield client, app
-    finally:
-        for suffix in ("", "-wal", "-shm"):
-            path = Path(f"{database_path}{suffix}")
-            if path.exists():
-                path.unlink()
+    @asynccontextmanager
+    async def test_lifespan(application: FastAPI) -> AsyncIterator[None]:
+        engine, factory = create_engine_and_session_factory(
+            DatabaseSettings(
+                url=f"sqlite+aiosqlite:///{database_path.as_posix()}",
+                path=database_path,
+            )
+        )
+        await migrate_engine(engine)
+        application.state.database_settings = None
+        application.state.db_engine = engine
+        application.state.db_session_factory = factory
+        application.state.admin_auth_settings = AdminAuthSettings.from_env()
+        application.state.collector_http_client = None
+        application.state.commerce_runtime = build_commerce_runtime()
+        try:
+            yield
+        finally:
+            await dispose_engine(engine)
+
+    app = create_app()
+    app.router.lifespan_context = test_lifespan
+    with TestClient(app, raise_server_exceptions=False) as client:
+        async def seed() -> None:
+            async with app.state.db_session_factory.begin() as session:
+                session.add(
+                    ShopBinding(
+                        id=_SHOP_ID,
+                        open_id="owner-1",
+                        shop_id="shop-1",
+                        region="MY",
+                        authorization_status=AuthorizationStatus.ACTIVE.value,
+                    )
+                )
+
+        asyncio.run(seed())
+        yield client, app
 
 
 def _login(client: TestClient) -> str:
@@ -233,8 +256,158 @@ def _login(client: TestClient) -> str:
     return str(response.json()["csrf_token"])
 
 
+def test_translation_http_e2e_succeeds_with_controlled_azure_transport(
+    value_api: tuple[TestClient, FastAPI],
+) -> None:
+    """Offline HTTP E2E: no live Azure or platform request is made."""
+
+    client, app = value_api
+    provider_requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        provider_requests.append(request)
+        assert request.url.host == "api.cognitive.microsofttranslator.com"
+        assert request.headers["Ocp-Apim-Subscription-Key"] == "provider-secret"
+        assert json.loads(request.content) == [{"Text": "你好商品"}]
+        return httpx.Response(
+            200,
+            json=[{"translations": [{"text": "Hello product", "to": "en"}]}],
+            headers={"X-RequestId": "offline-azure-request-1"},
+        )
+
+    provider = AzureTranslator(
+        AzureTranslatorConfig(
+            subscription_key="provider-secret",
+            region="southeastasia",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    app.state.commerce_runtime = replace(
+        app.state.commerce_runtime,
+        translation_provider=provider,
+        translation_configured=True,
+    )
+    csrf = _login(client)
+    capabilities = client.get(f"/api/shops/{_SHOP_ID}/tools/capabilities")
+    assert capabilities.status_code == 200
+    assert capabilities.json()["translation_configured"] is True
+
+    response = client.post(
+        f"/api/shops/{_SHOP_ID}/tools/translate",
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "offline-translation-success-0001",
+        },
+        json={
+            "texts": ["你好商品"],
+            "source_language": "zh-Hans",
+            "target_language": "en",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "texts": ["Hello product"],
+        "source_language": "zh-Hans",
+        "target_language": "en",
+        "provider": "AZURE_TRANSLATOR_V3",
+        "provider_request_id": "offline-azure-request-1",
+        "cached": False,
+    }
+    assert len(provider_requests) == 1
+
+    async def stored_result() -> tuple[IdempotentOperation, AuditLog]:
+        async with app.state.db_session_factory() as session:
+            operation = await session.scalar(
+                select(IdempotentOperation).where(
+                    IdempotentOperation.operation == "TRANSLATE"
+                )
+            )
+            audit = await session.scalar(
+                select(AuditLog).where(AuditLog.event_type == "translation.succeeded")
+            )
+            assert operation is not None
+            assert audit is not None
+            return operation, audit
+
+    operation, audit = asyncio.run(stored_result())
+    assert operation.state == WriteState.ACTIVE.value
+    assert operation.platform_request_id == "offline-azure-request-1"
+    assert operation.result_reference == "AZURE_TRANSLATOR_V3"
+    assert audit.outcome == "SUCCESS"
+    persisted = json.dumps(audit.redacted_details)
+    assert "你好商品" not in persisted
+    assert "provider-secret" not in persisted
+
+
+def test_translation_http_e2e_fails_closed_without_upstream_leakage(
+    value_api: tuple[TestClient, FastAPI],
+) -> None:
+    """Offline failure E2E keeps provider bodies and credentials outside HTTP and audit."""
+
+    client, app = value_api
+    upstream_body = "raw-upstream-body-must-not-leak"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=upstream_body)
+
+    provider = AzureTranslator(
+        AzureTranslatorConfig(
+            subscription_key="provider-secret",
+            region="southeastasia",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    app.state.commerce_runtime = replace(
+        app.state.commerce_runtime,
+        translation_provider=provider,
+        translation_configured=True,
+    )
+    csrf = _login(client)
+    source_text = "private-source-text-must-not-leak"
+    response = client.post(
+        f"/api/shops/{_SHOP_ID}/tools/translate",
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "offline-translation-failure-0001",
+        },
+        json={
+            "texts": [source_text],
+            "source_language": "en",
+            "target_language": "ms",
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "TRANSLATION_UPSTREAM_FAILED"
+    assert upstream_body not in response.text
+    assert source_text not in response.text
+    assert "provider-secret" not in response.text
+
+    async def stored_failure() -> tuple[IdempotentOperation, AuditLog]:
+        async with app.state.db_session_factory() as session:
+            operation = await session.scalar(
+                select(IdempotentOperation).where(
+                    IdempotentOperation.operation == "TRANSLATE"
+                )
+            )
+            audit = await session.scalar(
+                select(AuditLog).where(AuditLog.event_type == "translation.failed")
+            )
+            assert operation is not None
+            assert audit is not None
+            return operation, audit
+
+    operation, audit = asyncio.run(stored_failure())
+    assert operation.state == WriteState.FAILED.value
+    assert operation.manual_review_reason == "Azure Translator request failed"
+    assert audit.outcome == "FAILED"
+    persisted = json.dumps(audit.redacted_details)
+    assert upstream_body not in persisted
+    assert source_text not in persisted
+    assert "provider-secret" not in persisted
+
+
 def test_tools_api_reports_real_configuration_and_never_persists_translation_text(
-    value_api: tuple[TestClient, object],
+    value_api: tuple[TestClient, FastAPI],
 ) -> None:
     client, app = value_api
     csrf = _login(client)
@@ -270,7 +443,7 @@ def test_tools_api_reports_real_configuration_and_never_persists_translation_tex
 
 
 def test_profit_and_webhook_routes_use_csrf_and_fail_closed_audit(
-    value_api: tuple[TestClient, object],
+    value_api: tuple[TestClient, FastAPI],
 ) -> None:
     client, app = value_api
     csrf = _login(client)

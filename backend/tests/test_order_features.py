@@ -20,6 +20,7 @@ from app.domain.orders import (
 from app.domain.scopes import ScopeSet
 from app.integrations.tiktok.client import TikTokResult
 from app.integrations.tiktok.orders import TikTokOrderGateway
+from app.repositories.orders import upsert_orders
 from app.use_cases.commerce_context import CommerceAccessBlocked, ShopAccessContext
 from app.use_cases.orders import OrderService, detail_batches
 from migrations.core import migrate_engine
@@ -127,6 +128,7 @@ def detail_order(order_id: str) -> NormalizedOrder:
                 sale_price=Decimal("14.95"),
             ),
         ),
+        lines_present=True,
         fulfillment_type="FULFILLMENT_BY_SELLER",
         shipping_type="TIKTOK_SHIPPING",
         currency="MYR",
@@ -208,6 +210,188 @@ def test_order_detail_batches_enforce_platform_limit() -> None:
         detail_batches(["same", "same"])
     with pytest.raises(ValueError, match="between 1 and 50"):
         detail_batches(["one"], size=51)
+
+
+@pytest.mark.asyncio
+async def test_order_update_without_line_field_preserves_stored_lines() -> None:
+    engine, factory, binding = await order_factory()
+    initial = normalize_order(
+        {
+            "id": "order-presence",
+            "status": "UNPAID",
+            "line_items": [{"id": "line-existing", "quantity": 2}],
+        }
+    )
+    summary_only = normalize_order(
+        {"id": "order-presence", "status": "AWAITING_SHIPMENT"}
+    )
+    assert initial.lines_present is True
+    assert summary_only.lines_present is False
+    try:
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(initial,),
+                detail=True,
+            )
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(summary_only,),
+                detail=True,
+            )
+        async with factory() as session:
+            record = await session.scalar(select(OrderRecord))
+            lines = tuple(await session.scalars(select(OrderLineRecord)))
+            assert record is not None
+            assert record.order_status == "AWAITING_SHIPMENT"
+            assert record.item_count == 2
+            assert [line.platform_line_id for line in lines] == ["line-existing"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_order_list_empty_then_missing_detail_preserves_stored_lines() -> None:
+    engine, factory, binding = await order_factory()
+    initial = normalize_order(
+        {
+            "id": "order-presence",
+            "status": "UNPAID",
+            "line_items": [{"id": "line-existing", "quantity": 2}],
+        }
+    )
+    list_with_explicit_empty = normalize_order(
+        {
+            "id": "order-presence",
+            "status": "AWAITING_SHIPMENT",
+            "items": [],
+        }
+    )
+    detail_without_lines = normalize_order(
+        {"id": "order-presence", "status": "SHIPPED"}
+    )
+    assert list_with_explicit_empty.lines_present is True
+    assert detail_without_lines.lines_present is False
+    try:
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(initial,),
+                detail=True,
+            )
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(list_with_explicit_empty,),
+                detail=False,
+            )
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(detail_without_lines,),
+                detail=True,
+            )
+        async with factory() as session:
+            record = await session.scalar(select(OrderRecord))
+            lines = tuple(await session.scalars(select(OrderLineRecord)))
+            assert record is not None
+            assert record.order_status == "SHIPPED"
+            assert record.item_count == 2
+            assert [line.platform_line_id for line in lines] == ["line-existing"]
+            assert [line.quantity for line in lines] == [2]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_order_update_with_explicit_empty_lines_clears_stored_lines() -> None:
+    engine, factory, binding = await order_factory()
+    initial = normalize_order(
+        {
+            "id": "order-presence",
+            "status": "UNPAID",
+            "line_items": [{"id": "line-existing", "quantity": 2}],
+        }
+    )
+    explicit_empty = normalize_order(
+        {"id": "order-presence", "status": "CANCELLED", "line_items": []}
+    )
+    assert explicit_empty.lines_present is True
+    try:
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(initial,),
+                detail=True,
+            )
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(explicit_empty,),
+                detail=True,
+            )
+        async with factory() as session:
+            record = await session.scalar(select(OrderRecord))
+            lines = tuple(await session.scalars(select(OrderLineRecord)))
+            assert record is not None
+            assert record.order_status == "CANCELLED"
+            assert record.item_count == 0
+            assert lines == ()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_order_update_with_present_lines_replaces_stored_lines() -> None:
+    engine, factory, binding = await order_factory()
+    initial = normalize_order(
+        {
+            "id": "order-presence",
+            "status": "UNPAID",
+            "items": [{"id": "line-old", "quantity": 1}],
+        }
+    )
+    replacement = normalize_order(
+        {
+            "id": "order-presence",
+            "status": "SHIPPED",
+            "items": [{"id": "line-new", "quantity": 3}],
+        }
+    )
+    assert replacement.lines_present is True
+    try:
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(initial,),
+                detail=False,
+            )
+        async with factory.begin() as session:
+            await upsert_orders(
+                session,
+                shop_binding_id=binding.id,
+                orders=(replacement,),
+                detail=False,
+            )
+        async with factory() as session:
+            record = await session.scalar(select(OrderRecord))
+            lines = tuple(await session.scalars(select(OrderLineRecord)))
+            assert record is not None
+            assert record.order_status == "SHIPPED"
+            assert record.item_count == 3
+            assert [line.platform_line_id for line in lines] == ["line-new"]
+            assert [line.quantity for line in lines] == [3]
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

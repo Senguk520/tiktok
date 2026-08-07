@@ -38,6 +38,7 @@ class NormalizedOrder:
     order_id: str
     status: str
     lines: tuple[NormalizedOrderLine, ...] = ()
+    lines_present: bool = False
     fulfillment_type: str | None = None
     shipping_type: str | None = None
     currency: str | None = None
@@ -49,6 +50,8 @@ class NormalizedOrder:
         if not self.order_id.strip() or not self.status.strip():
             raise OrderPayloadError("order id and status are required")
         line_ids = [line.line_id for line in self.lines]
+        if self.lines and not self.lines_present:
+            raise OrderPayloadError("order lines require explicit presence")
         if len(line_ids) != len(set(line_ids)):
             raise OrderPayloadError("order line ids must be unique")
         if self.total_amount is not None and self.total_amount < 0:
@@ -145,7 +148,9 @@ def normalize_order(raw: Mapping[str, Any]) -> NormalizedOrder:
     payment_value = raw.get("payment")
     payment = payment_value if isinstance(payment_value, Mapping) else {}
     currency = _optional_text(payment.get("currency") or raw.get("currency"))
-    line_values = raw.get("line_items", raw.get("items", []))
+    line_key = next((key for key in ("line_items", "items") if key in raw), None)
+    lines_present = line_key is not None
+    line_values = raw[line_key] if line_key is not None else []
     if not isinstance(line_values, Sequence) or isinstance(
         line_values, (str, bytes, bytearray)
     ):
@@ -158,6 +163,7 @@ def normalize_order(raw: Mapping[str, Any]) -> NormalizedOrder:
         order_id=_required_text(raw, ("id", "order_id"), field="order id"),
         status=_required_text(raw, ("status", "order_status"), field="order status").upper(),
         lines=lines,
+        lines_present=lines_present,
         fulfillment_type=_optional_text(raw.get("fulfillment_type")),
         shipping_type=_optional_text(raw.get("shipping_type")),
         currency=currency.upper() if currency else None,
@@ -194,6 +200,7 @@ def normalized_order_to_payload(order: NormalizedOrder) -> dict[str, Any]:
         "source_updated_at": (
             order.source_updated_at.isoformat() if order.source_updated_at else None
         ),
+        "lines_present": order.lines_present,
         "lines": [
             {
                 "line_id": line.line_id,

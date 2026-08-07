@@ -82,12 +82,11 @@ async def upsert_orders(
         record.last_seen_at = current
         record.normalized_hash = incoming_hash
         if detail:
-            record.item_count = order.item_count
             record.detail_synced_at = current
-            await _replace_lines(session, order_record=record, order=order)
-        elif order.lines:
-            # Some list responses contain complete line summaries; retaining
-            # them is safe, but an empty list response never deletes details.
+        if order.lines_present and (detail or bool(order.lines)):
+            # Detail payloads may explicitly clear lines. List payloads may
+            # update non-empty summaries, but an empty list never erases
+            # previously persisted full details.
             record.item_count = order.item_count
             await _replace_lines(session, order_record=record, order=order)
         stored.append(record)
