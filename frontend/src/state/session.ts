@@ -10,11 +10,13 @@ const csrfToken = ref<string | null>(null)
 const expiresAt = ref<string | null>(null)
 const lastError = ref('')
 const loginPending = ref(false)
+const needsCheck = ref(true)
 
 const setAnonymous = (): void => {
   phase.value = 'anonymous'
   csrfToken.value = null
   expiresAt.value = null
+  needsCheck.value = true
 }
 
 const expire = (): void => {
@@ -28,7 +30,7 @@ const check = async (): Promise<void> => {
   try {
     const status = await coreApi.sessionStatus()
     expiresAt.value = status.expires_at
-    phase.value = csrfToken.value ? 'authenticated' : 'readonly'
+    phase.value = status.authenticated && csrfToken.value ? 'authenticated' : 'readonly'
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       setAnonymous()
@@ -36,6 +38,8 @@ const check = async (): Promise<void> => {
     }
     setAnonymous()
     lastError.value = error instanceof Error ? error.message : '无法检查管理员会话'
+  } finally {
+    needsCheck.value = false
   }
 }
 
@@ -47,6 +51,7 @@ const login = async (bootstrapSecret: string): Promise<void> => {
     csrfToken.value = created.csrf_token
     expiresAt.value = created.expires_at
     phase.value = 'authenticated'
+    needsCheck.value = true
   } catch (error) {
     setAnonymous()
     lastError.value = error instanceof Error ? error.message : '管理员登录失败'
@@ -68,6 +73,7 @@ export const useAdminSession = () => ({
   expiresAt: readonly(expiresAt),
   lastError: readonly(lastError),
   loginPending: readonly(loginPending),
+  needsCheck: readonly(needsCheck),
   authenticated: computed(() => phase.value === 'authenticated'),
   canRead: computed(() => phase.value === 'authenticated' || phase.value === 'readonly'),
   canWrite: computed(() => phase.value === 'authenticated' && Boolean(csrfToken.value)),

@@ -31,8 +31,6 @@ export const router = createRouter({
   ],
 })
 
-let sessionChecked = false
-
 onUnauthorized(() => {
   useAdminSession().expire()
   useShopContext().resetShops()
@@ -43,9 +41,8 @@ onUnauthorized(() => {
 
 router.beforeEach(async (to) => {
   const session = useAdminSession()
-  if (!sessionChecked) {
+  if (session.needsCheck.value) {
     await session.check()
-    sessionChecked = true
   }
   if (to.name === 'login') {
     return session.authenticated.value && to.query.reauth !== '1' ? { name: 'overview' } : true

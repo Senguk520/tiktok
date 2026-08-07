@@ -195,12 +195,89 @@
 - 前端生产构建：`cd frontend && npm run build`，通过；保留既有的主包超过 500 kB 警告。
 - 妙手专项离线测试覆盖签名确定性、配置失败关闭、HTTPS 基址限制、上游错误脱敏、店铺字段规范化、未登录拒绝、Provider 未启用阻断及受控 transport 下只读返回。
 
-### 真实联调状态
+### 真实联调状态（2026-08-07 证据校正）
 
-- **未执行真实 Shop Query，不计为通过。** 当前进程中 `MIAOSHOU_ENABLED`、`MIAOSHOU_APP_KEY`、`MIAOSHOU_APP_SECRET`、`MIAOSHOU_BASE_URL` 均未设置，仓库中也没有本地 `resources/config.json` 凭据文件。
-- 在线 Apifox 文档当前需要密码，无法独立复核官方鉴权契约；本阶段实现依据仅为本地接口材料、Skill reference 和脚本的一致描述。
-- 因缺少显式环境凭据且官方在线契约不可独立核验，未从敏感文档自动提取或尝试任何凭据，也未向真实上游发起请求。精确阻塞为 `MIAOSHOU_PROVIDER_DISABLED`；即使只打开开关，缺少凭据仍会转为 `BLOCKED_LIVE_CREDENTIALS`。
+- 当前会话历史中曾出现“真实只读 Shop Query 返回 1 家 TikTok/MY 可用店铺”的执行报告，但仓库、终端记录和脱敏验收产物中没有找到足以独立复现该结论的持久证据。
+- 因此正式状态既不继续断言“从未执行”，也不标记为“已验收通过”，统一记为：**`REQUIRES_REPRODUCIBLE_READONLY_RECHECK`**。
+- 重新验收只允许 Shop Query，产物仅记录时间、能力、站点、店铺数量、不可逆脱敏标识、状态和错误类别；不得保存请求签名、Token、Secret、完整响应或调用任何写接口。
+- Provider 默认关闭与缺配置 fail-closed 的结论不变；没有显式本机环境配置时仍返回 `MIAOSHOU_PROVIDER_DISABLED` / `BLOCKED_LIVE_CREDENTIALS`。
 
-### 计划状态说明
+### 计划状态说明（已被最新版计划取代）
 
-计划文件 YAML 中八项 todo 仍保持 `pending`：它们是全项目验收项，本次可选只读 Provider 里程碑没有完成任一整项，故不将局部实现虚报为项目级完成。
+旧计划中八项全为 `pending` 的粗粒度状态不再适合当前代码库。2026-08-07 已按源码、测试和真实验收边界重构为 11 个可验证里程碑；详细状态以 [`tiktok_单店管理系统_84523573.plan.md`](tiktok_单店管理系统_84523573.plan.md) 为准。
+
+## 最新版计划重构（2026-08-07 阶段更新）
+
+### 盘点范围
+
+- 当前 Git 基线及近七次提交；
+- Core/Collector 入口、API Router、领域模型、迁移、集成层、用例和测试清单；
+- Vue 路由、状态、页面与前端测试；
+- 妙手 Core Provider 与七组 Skills 的职责边界；
+- 旧问题清单、环境模板和交付文档缺口。
+
+### 重构结果
+
+- 删除“从空仓库构建”“当前只有一个接口文件”等历史假设，将当前双服务、双 SQLite、Vue 管理台、TikTok 官方主链路、Collector 隔离边界和妙手可选 Provider 作为新基线。
+- Frontmatter 重拆为 11 个里程碑：5 个 `completed`、2 个 `in_progress`、4 个 `pending`。`completed` 只表示工程边界和离线证据完成，不代表真实平台验收。
+- 新 Roadmap 分为 P0-P5：可信基线、TikTok 授权、商品生命周期、Provider 编排、订单/工具/自动化稳固、真实联调与 Windows 交付。
+- 明确妙手 Shop Query 已进入 Core；Source Import、公共采集箱、认领、类目推荐、产品编辑和发布仍是 Skills/脚本资产，不得据此宣称 Core 已集成。
+- 保留 TikTok 官方 API 作为店铺事实与刊登主链路；妙手写能力必须显式选择 Provider，并在预览、CSRF、幂等、审计和结果对账完成前保持禁用。
+
+### 首个执行 Checkpoint
+
+下一阶段为 **P0-A：Session 与边界测试**：
+
+1. 修复前端模块级 `sessionChecked` 的重登风险；
+2. 补齐 Session 登出、401、readonly 和重新登录专项测试；
+3. 补充 Collector 图片路由直接无签名 `401` 回归；
+4. 完成后运行前后端完整质量门槛并更新本文。
+
+### 尚未解决的阻塞
+
+- TikTok OAuth 领域能力尚未形成 HTTP + UI 闭环；
+- 商品编辑、价格、库存、上下架和删除尚未形成完整 API + UI 生命周期；
+- 订单不完整详情仍存在误清空已有行的风险；
+- 翻译成功 HTTP E2E、`ToolsView` 交互、真实 TikTok/CJ/1688/Azure 联调仍缺证据；
+- `.env.example` 未覆盖完整运行配置，README 与 Windows/合规/风险文档缺失；
+- 妙手真实只读结果需要按脱敏格式重新执行并持久化证据。
+
+### 本轮验证方式
+
+- 本轮只修改计划、进度和外部记忆文档，没有重新运行 pytest、Ruff、前端测试、类型检查或构建。
+- 通过当前源码结构、测试文件、近期 Git 提交和 Git Diff 进行状态核对；既有 `152 passed, 1 skipped` 与前端 `6 passed` 仅作为历史验证证据引用。
+- `docs/remember.md` 保存本轮逐 Checkpoint 的可接续事实，但不替代本计划或本文的正式状态。
+
+## P0-A 实际执行更新（2026-08-07）
+
+### 状态
+
+**P0-A：Session 与边界测试已完成（离线/模块级验证）。** 本更新只覆盖 P0-A，不提前变更 P0-B 订单、翻译或其他能力状态；主计划 frontmatter 中的 `p0-trustworthy-baseline` 仍保持 `in_progress`，但正文已将 P0-A 标记完成并把最近下一步推进到 P0-B。
+
+### 实际修改文件
+
+- `frontend/src/router/index.ts`：移除模块级一次性 `sessionChecked`，路由守卫改为消费 Session 状态的 `needsCheck`。
+- `frontend/src/state/session.ts`：由 Session 状态模块管理检查生命周期；初始检查、登录、登出和 `expire()` 会重新标记需检查，`check()` 完成后清除标记；同时按 Core `authenticated` 状态判定只读/认证阶段。
+- `frontend/tests/session.test.ts`：新增 4 个模块/状态行为回归，覆盖登出清理 `csrfToken/expiresAt`、401/expire 清理 token、readonly+token 不可写、登出后重新登录再次执行 session check。
+- `backend/tests/test_collector_http_boundary.py`：新增直接无签名图片路由请求的 `401` 回归，沿用 `tmp_path` 数据库与 ASGI transport。
+- `docs/tiktok_单店管理系统_84523573.plan.md`：将 P0-A 标记为已完成、关闭对应风险项，并把最近下一步推进到 P0-B。
+- `docs/remember.md`：追加本轮阶段事实。
+- `docs/progress-review-2026-08-06.md`：追加本次实际验证记录。
+
+### 精确命令与结果
+
+- `Set-Location 'H:\tiktok\frontend'; npm test -- --run tests/session.test.ts` → 1 个文件、4 个测试通过。
+- `Set-Location 'H:\tiktok\frontend'; npm test` → 5 个测试文件、10 个测试通过。
+- `Set-Location 'H:\tiktok\frontend'; npm run typecheck` → `vue-tsc --noEmit` 通过。
+- `Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m pytest -q tests/test_collector_http_boundary.py -k unsigned_image_route` → 1 通过、6 个 deselected、1 个既有 Starlette/httpx 弃用 warning。
+- `Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m pytest -q tests/test_collector_http_boundary.py` → 7 个边界测试通过、1 个既有 warning。
+- `Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m ruff check tests/test_collector_http_boundary.py` → `All checks passed!`。
+- `Set-Location 'H:\tiktok'; git diff --check` → 通过；仅报告 LF/CRLF 转换提示。
+
+### 未执行项、阻塞与下一步
+
+- 未执行后端全量 pytest、后端全量 Ruff、前端生产 build；也未执行会清理目录、删除固定磁盘文件或涉及业务缓存/持久化缓存的测试。故不能把本轮结果表述为全量质量门槛通过。
+- 已知 warning 仅为测试依赖的既有 Starlette/httpx 弃用提示；本轮没有升级依赖。
+- P0-A 未覆盖的 P0-B 风险仍包括不完整订单详情误清空订单行、翻译成功 HTTP E2E 与 `ToolsView` 交互；下一步按计划进入 P0-B，再在安全范围内决定全量门槛执行。
+- `Set-Location 'H:\tiktok'; npm test`（以及同目录的首次 Session 命令）因仓库根目录没有 `package.json` 返回 `ENOENT`；随后显式切换到 `H:\tiktok\frontend` 重跑，结果如上，未把该失败计入测试通过数。
+- 最终精确复跑：`Set-Location 'H:\tiktok\backend'; .\.venv\Scripts\python.exe -m pytest -q tests/test_collector_http_boundary.py::test_unsigned_image_route_is_rejected_before_lookup` → `1 passed, 1 warning`。

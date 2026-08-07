@@ -334,6 +334,22 @@ async def test_collector_api_fails_closed_without_hmac_configuration(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_unsigned_image_route_is_rejected_before_lookup(tmp_path: Path) -> None:
+    engine, factory = await _collector_database(tmp_path)
+    app = _internal_app(factory)
+    try:
+        async with httpx.AsyncClient(
+            transport=_transport(app),
+            base_url=COLLECTOR_BASE_URL,
+        ) as raw:
+            response = await raw.get(f"/internal/v1/images/{uuid4()}")
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "INTERNAL_AUTHENTICATION_FAILED"
+    finally:
+        await engine.dispose()  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_export_image_import_and_receipt_ack_cross_only_http_boundary(tmp_path: Path) -> None:
     collector_engine, collector_sessions = await _collector_database(tmp_path)
     core_engine, core_sessions = await _core_database()
